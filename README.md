@@ -167,25 +167,4 @@ astrbot_plugin_vrc_friend_radar/
 ## 注意事项
 
 - 请合理设置轮询间隔，避免过于频繁请求接口
-- 建议优先监控真正需要关注的好友，减少无效推送
-- 若准备公开仓库，不要提交本地数据库、缓存与登录态文件
-- VRChat API 的可用性与返回字段可能会变化，必要时需做兼容调整
 
----
-
-## 开源信息
-
-MIT 风格开源整理建议可自行补充 License 文件。
-
-如果你准备正式公开发布，建议同时补充：
-
-- LICENSE
-- 发布截图
-- 更新日志
-- 示例配置
-
----
-
-## Repository
-
-https://github.com/zhumengling/astrbot_plugin_vrc_friend_radar
