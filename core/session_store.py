@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from astrbot.api import logger
 
 
 class SessionStore:
@@ -16,7 +17,8 @@ class SessionStore:
             return None
         try:
             return json.loads(self.file_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            logger.error(f"[vrc_friend_radar] 读取 session.json 失败: {exc}", exc_info=True)
             return None
 
     def clear(self) -> None:

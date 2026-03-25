@@ -226,6 +226,33 @@ class VRChatClient:
         except Exception:
             return []
 
+
+    async def download_image_authenticated(self, url: str, save_path: str) -> str:
+        return await asyncio.to_thread(self._download_image_authenticated_sync, url, save_path)
+
+    def _download_image_authenticated_sync(self, url: str, save_path: str) -> str:
+        if not url:
+            raise VRChatClientError("缺少图片地址")
+        if self._api_client is None:
+            raise VRChatClientError("尚未登录，无法使用已登录会话下载图片")
+        import urllib.request
+        cookie = getattr(self._api_client, 'cookie', '') or ''
+        headers = {
+            'User-Agent': self.user_agent,
+            'Referer': 'https://vrchat.com/',
+        }
+        if cookie:
+            headers['Cookie'] = cookie
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = resp.read()
+            with open(save_path, 'wb') as f:
+                f.write(data)
+            return save_path
+        except Exception as exc:
+            raise VRChatClientError(f"下载认证图片失败: {exc}") from exc
+
     def get_last_sync_debug(self) -> dict[str, int]:
         return dict(self._last_sync_debug)
 

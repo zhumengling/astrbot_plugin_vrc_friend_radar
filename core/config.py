@@ -23,23 +23,23 @@ class PluginConfig:
     def __init__(self, raw_config: Any, context: Any):
         self.raw_config = raw_config
         self.context = context
-        self.poll_interval_seconds = max(60, int(self._read("poll_interval_seconds", 90)))
-        self.notify_group_ids = list(self._read("notify_group_ids", []))
-        self.watch_friend_ids = list(self._read("watch_friend_ids", []))
-        self.enable_status_tracking = bool(self._read("enable_status_tracking", True))
-        self.enable_world_tracking = bool(self._read("enable_world_tracking", True))
+        self.poll_interval_seconds = max(60, self._read_int("poll_interval_seconds", 90))
+        self.notify_group_ids = self._read_list("notify_group_ids", [])
+        self.watch_friend_ids = self._read_list("watch_friend_ids", [])
+        self.enable_status_tracking = self._read_bool("enable_status_tracking", True)
+        self.enable_world_tracking = self._read_bool("enable_world_tracking", True)
         self.vrchat_user_agent = str(
             self._read(
                 "vrchat_user_agent",
                 "AstrBotVRCFriendRadar/0.1.0 contact@example.com",
             )
         ).strip()
-        self.login_session_timeout_seconds = max(30, int(self._read("login_session_timeout_seconds", 60)))
-        self.event_dedupe_window_seconds = max(30, int(self._read("event_dedupe_window_seconds", 300)))
-        self.event_batch_size = max(1, int(self._read("event_batch_size", 10)))
-        self.allow_auto_push = bool(self._read("allow_auto_push", True))
-        self.notify_location_detail = bool(self._read("notify_location_detail", True))
-        self.search_result_ttl_seconds = max(30, int(self._read("search_result_ttl_seconds", 120)))
+        self.login_session_timeout_seconds = max(30, self._read_int("login_session_timeout_seconds", 60))
+        self.event_dedupe_window_seconds = max(30, self._read_int("event_dedupe_window_seconds", 300))
+        self.event_batch_size = max(1, self._read_int("event_batch_size", 10))
+        self.allow_auto_push = self._read_bool("allow_auto_push", True)
+        self.notify_location_detail = self._read_bool("notify_location_detail", True)
+        self.search_result_ttl_seconds = max(30, self._read_int("search_result_ttl_seconds", 120))
 
     def _read(self, key: str, default: Any):
         if hasattr(self.raw_config, "get"):
@@ -48,6 +48,38 @@ class PluginConfig:
             except TypeError:
                 pass
         return getattr(self.raw_config, key, default)
+
+    def _read_int(self, key: str, default: int) -> int:
+        value = self._read(key, default)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _read_bool(self, key: str, default: bool) -> bool:
+        value = self._read(key, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+        return bool(value)
+
+    def _read_list(self, key: str, default: list[str]) -> list[str]:
+        value = self._read(key, default)
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, tuple):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            return [item.strip() for item in text.split(',') if item.strip()]
+        return list(default)
 
     @property
     def plugin_dir(self) -> Path:

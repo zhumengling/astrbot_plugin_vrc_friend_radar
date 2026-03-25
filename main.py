@@ -1,4 +1,8 @@
 import math
+import tempfile
+import uuid
+import asyncio
+from pathlib import Path
 import time
 from astrbot.api import logger
 from astrbot.api.event import filter
@@ -89,6 +93,24 @@ class VRCFriendRadarPlugin(Star):
         except Exception:
             pass
         return None
+
+    async def _download_image_to_temp(self, url: str) -> str | None:
+        if not url:
+            return None
+        suffix = '.jpg'
+        lowered = url.lower()
+        if '.png' in lowered:
+            suffix = '.png'
+        elif '.webp' in lowered:
+            suffix = '.webp'
+        temp_dir = Path(tempfile.gettempdir()) / 'vrc_friend_radar'
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = temp_dir / f"world_logo_{uuid.uuid4().hex}{suffix}"
+        try:
+            return await self.monitor.client.download_image_authenticated(url, str(file_path))
+        except Exception as exc:
+            logger.error(f"[vrc_friend_radar] 下载地图Logo失败: {exc}")
+            return None
 
     async def _get_world_name(self, location: str | None) -> str:
         world_id = extract_world_id(location)
@@ -208,14 +230,28 @@ class VRCFriendRadarPlugin(Star):
         if not results:
             yield event.plain_result("没有搜索到匹配地图。")
             return
-        lines = [f"搜索到 {len(results)} 个地图结果："]
-        images = []
+        header = f"搜索到 {len(results)} 个地图结果："
+        first_line = ""
+        rest_lines = []
+        first_img = ""
         for idx, item in enumerate(results, start=1):
-            lines.append(f"{idx}. {item.get('name', '未知地图')} | 作者: {item.get('author_name', '未知')} | ID: {item.get('id', '')}")
-            img = item.get('thumbnail_image_url') or item.get('image_url')
-            if img:
-                images.append(Image.fromURL(img))
-        yield event.chain_result([MessageChain([Plain("\n".join(lines))] + images)])
+            line = f"{idx}. {item.get('name', '未知地图')} | 作者: {item.get('author_name', '未知')} | ID: {item.get('id', '')}"
+            if idx == 1:
+                first_line = line
+                first_img = item.get('thumbnail_image_url') or item.get('image_url') or ""
+            else:
+                rest_lines.append(line)
+        components = [Plain(header + "\n" + first_line)]
+        if first_img:
+            local_img = await self._download_image_to_temp(first_img)
+            if local_img:
+                try:
+                    components.append(Image.fromFileSystem(local_img))
+                except Exception as exc:
+                    logger.error(f"[vrc_friend_radar] 构造本地图像消息失败: {exc}")
+        if rest_lines:
+            components.append(Plain("\n" + "\n".join(rest_lines)))
+        yield event.chain_result(components)
 
     @filter.command("vrc搜索好友")
     async def search_friends(self, event: AiocqhttpMessageEvent):
@@ -274,6 +310,9 @@ class VRCFriendRadarPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc登录")
     async def interactive_login(self, event: AiocqhttpMessageEvent):
+        if self._get_group_id(event):
+            yield event.plain_result("为了账号安全，请私聊 Bot 发送登录账号和密码，不要在群里发送。")
+            return
         raw = event.message_str.replace("vrc登录", "", 1).strip()
         parts = raw.split()
         if len(parts) < 2:
@@ -307,16 +346,17 @@ class VRCFriendRadarPlugin(Star):
             yield event.plain_result("用法：/vrc验证码 123456")
             return
         session_key = self._build_session_key(event)
-        pending = self.monitor.pop_pending_login(session_key)
+        pending = self.monitor.get_pending_login(session_key)
         if not pending:
             yield event.plain_result("当前没有等待验证的登录会话，请先发送：/vrc登录 用户名 密码")
             return
         try:
             result = await self.monitor.test_login(username=pending.username, password=pending.password, two_factor_code=code)
+            self.monitor.pop_pending_login(session_key)
             yield event.plain_result(f"VRChat 登录成功\n用户ID: {result.user_id}\n显示名: {result.display_name}")
         except VRChatClientError as exc:
             logger.error(f"[vrc_friend_radar] 验证码登录失败: {exc}")
-            yield event.plain_result(f"验证码登录失败：{exc}")
+            yield event.plain_result(f"验证码登录失败：{exc}，你可以直接重新发送 /vrc验证码 123456 重试。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc同步好友")

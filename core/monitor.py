@@ -11,6 +11,7 @@ from .models import FriendSnapshot, RadarEvent
 from .notifier import Notifier
 from .repository import SettingsRepository
 from .session_store import SessionStore
+from astrbot.api import logger
 from .vrchat_client import LoginResult, VRChatClient, VRChatClientError
 
 
@@ -106,8 +107,8 @@ class MonitorService:
                     events = await self.detect_changes()
                     if events and self._event_callback:
                         await self._event_callback(events)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error(f"[vrc_friend_radar] 轮询检测失败: {exc}", exc_info=True)
             await asyncio.sleep(self.cfg.poll_interval_seconds)
 
     async def test_login(self, username: str, password: str, two_factor_code: str | None = None) -> LoginResult:
@@ -177,6 +178,10 @@ class MonitorService:
 
     def create_pending_login(self, session_key: str, username: str, password: str, method: str) -> None:
         self._pending_logins[session_key] = PendingLoginSession(session_key=session_key, username=username, password=password, created_at=time.time(), method=method)
+
+    def get_pending_login(self, session_key: str) -> PendingLoginSession | None:
+        self._cleanup_pending_logins()
+        return self._pending_logins.get(session_key)
 
     def pop_pending_login(self, session_key: str) -> PendingLoginSession | None:
         self._cleanup_pending_logins()

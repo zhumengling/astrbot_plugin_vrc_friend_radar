@@ -116,11 +116,11 @@ class RadarDB:
         conn = sqlite3.connect(self.cfg.db_path)
         try:
             rows = conn.execute(
-                "SELECT friend_user_id, event_type, old_value, new_value, created_at FROM event_history ORDER BY id DESC LIMIT ?",
+                "SELECT eh.friend_user_id, COALESCE(fs.display_name, eh.friend_user_id), eh.event_type, eh.old_value, eh.new_value, eh.created_at FROM event_history eh LEFT JOIN friend_snapshots fs ON eh.friend_user_id = fs.friend_user_id ORDER BY eh.id DESC LIMIT ?",
                 (limit,),
             ).fetchall()
             return [
-                RadarEvent(friend_user_id=row[0], display_name=row[0], event_type=row[1], old_value=row[2], new_value=row[3], created_at=row[4])
+                RadarEvent(friend_user_id=row[0], display_name=row[1], event_type=row[2], old_value=row[3], new_value=row[4], created_at=row[5])
                 for row in rows
             ]
         finally:

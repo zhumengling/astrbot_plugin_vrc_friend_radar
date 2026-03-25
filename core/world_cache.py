@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from astrbot.api import logger
 
 
 class WorldCache:
@@ -16,11 +17,15 @@ class WorldCache:
             return
         try:
             self._cache = json.loads(self.file_path.read_text(encoding='utf-8'))
-        except Exception:
+        except Exception as exc:
+            logger.error(f"[vrc_friend_radar] 读取 world_cache.json 失败: {exc}", exc_info=True)
             self._cache = {}
 
     def save(self) -> None:
-        self.file_path.write_text(json.dumps(self._cache, ensure_ascii=False, indent=2), encoding='utf-8')
+        try:
+            self.file_path.write_text(json.dumps(self._cache, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception as exc:
+            logger.error(f"[vrc_friend_radar] 写入 world_cache.json 失败: {exc}", exc_info=True)
 
     def get(self, world_id: str) -> dict | None:
         return self._cache.get(world_id)

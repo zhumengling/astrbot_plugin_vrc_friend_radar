@@ -6,17 +6,22 @@ from .models import FriendSnapshot
 class SettingsRepository:
     def __init__(self, cfg: PluginConfig):
         self.cfg = cfg
+        self._initialized = False
 
     def initialize(self) -> None:
+        if self._initialized:
+            return
         conn = sqlite3.connect(self.cfg.db_path)
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS plugin_settings (setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL)")
             conn.commit()
+            self._initialized = True
         finally:
             conn.close()
 
     def _ensure_table(self) -> None:
-        self.initialize()
+        if not self._initialized:
+            self.initialize()
 
     def _get_raw(self, key: str) -> str | None:
         self._ensure_table()
