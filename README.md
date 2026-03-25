@@ -4,12 +4,7 @@ VRChat 好友状态监控插件，运行于 AstrBot。
 
 > 用来监控 VRChat 好友的上线、下线、状态变化与地图切换，并把变化整理后推送到指定群聊。
 
-## 仓库信息
 
-- Author: zhumengling
-- Repository: https://github.com/zhumengling/astrbot_plugin_vrc_friend_radar
-
----
 
 ## 功能特性
 
