@@ -1,0 +1,78 @@
+{
+  "poll_interval_seconds": {
+    "type": "int",
+    "description": "轮询间隔秒数",
+    "hint": "VRChat 官方建议不要高于每60秒一次请求，建议 90-120 秒。",
+    "default": 90
+  },
+  "notify_group_ids": {
+    "type": "list",
+    "description": "通知群号列表",
+    "hint": "需要推送好友状态变化的群号列表。",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "watch_friend_ids": {
+    "type": "list",
+    "description": "监控好友ID列表",
+    "hint": "只监控这些 VRChat 好友 ID。留空代表后续通过命令同步。",
+    "items": {
+      "type": "string"
+    },
+    "default": []
+  },
+  "enable_status_tracking": {
+    "type": "bool",
+    "description": "是否追踪状态变化",
+    "default": true
+  },
+  "enable_world_tracking": {
+    "type": "bool",
+    "description": "是否追踪地图变化",
+    "default": true
+  },
+  "vrchat_user_agent": {
+    "type": "string",
+    "description": "VRChat User-Agent",
+    "hint": "建议带上可联系邮箱，例如 AstrBotVRCFriendRadar/0.1.0 you@example.com",
+    "default": "AstrBotVRCFriendRadar/0.1.0 contact@example.com"
+  },
+  "login_session_timeout_seconds": {
+    "type": "int",
+    "description": "登录交互超时秒数",
+    "hint": "发起登录后，等待验证码的有效时间。",
+    "default": 60
+  },
+  "event_dedupe_window_seconds": {
+    "type": "int",
+    "description": "事件去重窗口秒数",
+    "hint": "同一好友的相同变化在这个时间窗口内只推送一次。",
+    "default": 300
+  },
+  "event_batch_size": {
+    "type": "int",
+    "description": "单次推送最大事件数",
+    "hint": "单轮检测最多合并多少条变化到一条消息里。",
+    "default": 10
+  },
+  "allow_auto_push": {
+    "type": "bool",
+    "description": "启用自动推送",
+    "hint": "关闭后仍可手动检测变化，但不会自动推送到群。",
+    "default": true
+  },
+  "notify_location_detail": {
+    "type": "bool",
+    "description": "显示位置详细信息",
+    "hint": "开启后会尽量对 VRChat 位置字段做更友好的文本格式化。",
+    "default": true
+  },
+  "search_result_ttl_seconds": {
+    "type": "int",
+    "description": "搜索结果有效期秒数",
+    "hint": "用于按序号添加监控时，搜索结果在内存中的保留时间。",
+    "default": 120
+  }
+}

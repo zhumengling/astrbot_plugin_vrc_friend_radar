@@ -1,6 +1,40 @@
-name: helloworld # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
-display_name: helloworld # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
-desc: AstrBot 插件示例。 # 插件简短描述
-version: v1.3.0 # 插件版本号。格式：v1.1.1 或者 v1.1
-author: Soulter # 作者
-repo: https://github.com/Soulter/helloworld # 插件的仓库地址
+name: astrbot_plugin_vrc_friend_radar
+display_name: VRChat好友雷达
+desc: 监控 VRChat 好友上线、下线、状态变化与地图切换，并将变化合并播报到指定群聊。
+help: |
+  功能说明：
+  - 支持 VRChat 登录与持久化登录恢复
+  - 支持同步好友列表、搜索好友、搜索地图
+  - 支持检测好友状态变化并自动推送到通知群
+  - 支持地图切换播报，地图名会优先通过 VRChat API 解析
+  - 支持监控白名单、通知群配置、去重防刷屏
+
+  管理员命令：
+  /vrc状态 - 查看插件运行状态
+  /vrc测试 - 查看插件是否在线
+  /vrc推送测试 - 向通知群发送一条测试播报
+  /vrc登录 用户名 密码 - 登录 VRChat
+  /vrc验证码 123456 - 提交二步验证码
+  /vrc解绑登录 - 清除本地持久化登录态
+  /vrc同步好友 - 同步好友缓存
+  /vrc好友列表 [页码] - 查看缓存好友列表
+  /vrc在线好友 [页码] - 查看当前缓存中的在线好友
+  /vrc检测变化 - 手动检测好友变化
+  /vrc最近事件 - 查看最近变化事件
+  /vrc绑定通知群 - 将当前群绑定为通知群
+  /vrc解绑通知群 - 将当前群从通知群移除
+  /vrc通知群 - 查看通知群列表
+  /vrc添加监控 usr_xxx - 添加监控好友
+  /vrc删除监控 usr_xxx - 删除监控好友
+  /vrc监控列表 - 查看监控好友列表
+  /vrc添加监控序号 N - 从最近一次好友搜索结果中按序号添加监控
+
+  所有人可用命令：
+  /vrc搜索好友 关键词 [页码] - 在本地好友缓存中模糊搜索
+  /vrc搜索地图 关键词 - 按地图名模糊搜索 VRChat 世界
+version: 0.1.0
+author: zhumengling
+repo: https://github.com/zhumengling/astrbot_plugin_vrc_friend_radar
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
