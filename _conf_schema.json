@@ -2,8 +2,8 @@
   "poll_interval_seconds": {
     "type": "int",
     "description": "轮询间隔秒数",
-    "hint": "VRChat 官方建议不要高于每60秒一次请求，建议 90-120 秒。",
-    "default": 90
+    "hint": "VRChat 官方建议不要高于每60秒一次请求，建议 180-300 秒。",
+    "default": 180
   },
   "notify_group_ids": {
     "type": "list",
@@ -36,14 +36,14 @@
   "vrchat_user_agent": {
     "type": "string",
     "description": "VRChat User-Agent",
-    "hint": "建议带上可联系邮箱，例如 AstrBotVRCFriendRadar/0.1.0 you@example.com",
+    "hint": "必须带上注册邮箱，不然登陆失败，例如 AstrBotVRCFriendRadar/0.1.0 123@qq.com",
     "default": "AstrBotVRCFriendRadar/0.1.0 contact@example.com"
   },
   "login_session_timeout_seconds": {
     "type": "int",
     "description": "登录交互超时秒数",
     "hint": "发起登录后，等待验证码的有效时间。",
-    "default": 60
+    "default": 30
   },
   "event_dedupe_window_seconds": {
     "type": "int",

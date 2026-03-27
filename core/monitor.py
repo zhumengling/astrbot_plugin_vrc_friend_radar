@@ -129,13 +129,38 @@ class MonitorService:
     async def detect_changes(self) -> list[RadarEvent]:
         old_map = self.db.get_friend_snapshot_map()
         new_snapshots = await self.client.fetch_friend_snapshots(self.get_effective_watch_friends())
-        events: list[RadarEvent] = []
+        raw_events: list[RadarEvent] = []
         for item in new_snapshots:
             old_item = old_map.get(item.friend_user_id)
             if old_item is None:
                 continue
-            events.extend(diff_snapshot(old_item, item))
-        events = self._dedupe_events(events)
+            raw_events.extend(diff_snapshot(old_item, item))
+
+        filtered_events: list[RadarEvent] = []
+        skipped_status_events = 0
+        skipped_world_events = 0
+        for event in raw_events:
+            if event.event_type in {"friend_online", "friend_offline", "status_changed", "status_message_changed"}:
+                if not self.cfg.enable_status_tracking:
+                    skipped_status_events += 1
+                    continue
+            if event.event_type == "location_changed":
+                if not self.cfg.enable_world_tracking:
+                    skipped_world_events += 1
+                    continue
+            filtered_events.append(event)
+
+        events = self._dedupe_events(filtered_events)
+        logger.info(
+            "[vrc_friend_radar] 本轮变化检测完成: status_tracking=%s, world_tracking=%s, raw_events=%s, filtered_events=%s, deduped_events=%s, skipped_status=%s, skipped_world=%s",
+            self.cfg.enable_status_tracking,
+            self.cfg.enable_world_tracking,
+            len(raw_events),
+            len(filtered_events),
+            len(events),
+            skipped_status_events,
+            skipped_world_events,
+        )
         self.db.upsert_friend_snapshots(new_snapshots)
         self.db.insert_event_history(events)
         self._last_sync_count = len(new_snapshots)

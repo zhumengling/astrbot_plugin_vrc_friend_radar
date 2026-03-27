@@ -118,12 +118,23 @@ class VRCFriendRadarPlugin(Star):
             return format_location(location)
         cached = self.world_cache.get(world_id)
         if cached and cached.get('name'):
+            logger.info(f"[vrc_friend_radar] 世界缓存命中: {world_id}")
             return cached['name']
+        logger.info(f"[vrc_friend_radar] 世界缓存未命中，开始拉取世界信息: {world_id}")
         info = await self.monitor.client.get_world_info(world_id)
         if info and info.get('name'):
             self.world_cache.set(world_id, info)
             return info['name']
         return '某个世界'
+
+    async def _format_world_display(self, location: str | None) -> str:
+        world_name = await self._get_world_name(location)
+        instance_text = format_location(location)
+        if not location or not extract_world_id(location):
+            return instance_text
+        if instance_text and instance_text != world_name:
+            return f"{world_name}（{instance_text}）"
+        return world_name
 
     async def _format_events_for_push(self, events):
         messages = []
@@ -380,8 +391,7 @@ class VRCFriendRadarPlugin(Star):
             return
         lines = [f"好友同步完成，本次写入 {len(snapshots)} 人，当前缓存总数 {total_cached} 人。", f"在线批次返回: {debug.get('online_batch_total', 0)} | 离线批次返回: {debug.get('offline_batch_total', 0)} | 合并后数量: {debug.get('merged_total', 0)}"]
         for idx, item in enumerate(preview, start=1):
-            world_name = await self._get_world_name(item.location)
-            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {world_name}")
+            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {format_location(item.location)}")
         if len(snapshots) > len(preview):
             lines.append("更多好友请使用 /vrc好友列表 1 查看。")
         yield event.plain_result("\n".join(lines))
@@ -401,8 +411,7 @@ class VRCFriendRadarPlugin(Star):
         total_pages = max(1, math.ceil(total_cached / page_size))
         lines = [f"当前缓存好友总数 {total_cached} 人，当前第 {page}/{total_pages} 页："]
         for idx, item in enumerate(snapshots, start=1):
-            world_name = await self._get_world_name(item.location)
-            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {world_name}")
+            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {format_location(item.location)}")
         if page < total_pages:
             lines.append(f"下一页可用：/vrc好友列表 {page + 1}")
         yield event.plain_result("\n".join(lines))
@@ -421,9 +430,19 @@ class VRCFriendRadarPlugin(Star):
         snapshots = self.monitor.list_online_cached_friends(limit=page_size, offset=(page - 1) * page_size)
         total_pages = max(1, math.ceil(total_online / page_size))
         lines = [f"当前在线好友总数 {total_online} 人，当前第 {page}/{total_pages} 页："]
+        cache_hits = 0
+        cache_misses = 0
         for idx, item in enumerate(snapshots, start=1):
-            world_name = await self._get_world_name(item.location)
-            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {world_name}")
+            world_id = extract_world_id(item.location)
+            if world_id:
+                cached = self.world_cache.get(world_id)
+                if cached and cached.get('name'):
+                    cache_hits += 1
+                else:
+                    cache_misses += 1
+            world_text = await self._format_world_display(item.location)
+            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {world_text}")
+        logger.info(f"[vrc_friend_radar] 在线好友列表世界解析完成: total={len(snapshots)}, cache_hits={cache_hits}, cache_misses={cache_misses}")
         if page < total_pages:
             lines.append(f"下一页可用：/vrc在线好友 {page + 1}")
         yield event.plain_result("\n".join(lines))
