@@ -193,9 +193,11 @@ class VRChatClient:
             return {
                 'id': world_id,
                 'name': str(getattr(world, 'name', '') or world_id),
+                'description': str(getattr(world, 'description', '') or ''),
                 'image_url': str(getattr(world, 'image_url', '') or ''),
                 'thumbnail_image_url': str(getattr(world, 'thumbnail_image_url', '') or ''),
                 'author_name': str(getattr(world, 'author_name', '') or ''),
+                'capacity': int(getattr(world, 'capacity', 0) or 0),
             }
         except Exception:
             return None

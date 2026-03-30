@@ -74,5 +74,53 @@
     "description": "搜索结果有效期秒数",
     "hint": "用于按序号添加监控时，搜索结果在内存中的保留时间。",
     "default": 120
+  },
+  "coroom_notify_interval_seconds": {
+    "type": "int",
+    "description": "同房提醒最短推送间隔秒数",
+    "hint": "同一同房提醒在该时间窗口内最多推送一次，不与普通事件去重窗口共用。",
+    "default": 600
+  },
+  "coroom_notify_min_members": {
+    "type": "int",
+    "description": "同房提醒最少人数阈值",
+    "hint": "同一实例内监控好友达到该人数及以上才判定为同房，自动提醒与同房情况查询都会按此阈值筛选。最小为2。",
+    "default": 2
+  },
+  "coroom_notify_joinable_only": {
+    "type": "bool",
+    "description": "同房提醒仅推送可加入实例",
+    "hint": "开启后自动同房提醒仅推送joinability为“可加入”的同房组；查询命令仍显示所有同房组并标注可加入性。",
+    "default": false
+  },
+  "enable_daily_report": {
+    "type": "bool",
+    "description": "是否启用自动日报推送",
+    "hint": "开启后在每日指定时间自动向通知群发送日报，同一天仅成功推送一次。",
+    "default": false
+  },
+  "daily_task_time": {
+    "type": "string",
+    "description": "每日任务默认触发时间(HH:MM)",
+    "hint": "用于所有每天只执行一次的任务默认时间；24小时制，例如 21:00。若某任务存在独立时间配置，则优先使用独立配置。",
+    "default": "21:00"
+  },
+  "daily_report_time": {
+    "type": "string",
+    "description": "自动日报触发时间(HH:MM)",
+    "hint": "24小时制，例如 21:00；格式非法时将回退到 21:00。",
+    "default": "21:00"
+  },
+  "daily_report_top_n": {
+    "type": "int",
+    "description": "日报与热门世界的Top条数",
+    "hint": "范围 1-20；同时用于 /vrc热门世界 默认展示数量。",
+    "default": 5
+  },
+  "world_translation_cache_max_entries": {
+    "type": "int",
+    "description": "世界简介翻译缓存最大条目数",
+    "hint": "每次写入翻译缓存后会按更新时间保留最近N条，超出部分自动清理；设为0可关闭清理。",
+    "default": 500
   }
 }

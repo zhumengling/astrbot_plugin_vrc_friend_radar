@@ -1,0 +1,8 @@
+feat: enhance VRChat friend radar with coroom alerts, daily report and world insights
+
+- add joinability status and coroom reminder support
+- add daily summary report and hot worlds statistics
+- add recommended world image and AI-based description translation
+- sync config lists with command-managed notify/watch lists
+- auto sync friends and reply online friends after login
+- improve cache cleanup, bug fixes, docs and stability

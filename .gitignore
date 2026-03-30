@@ -1,12 +1,30 @@
+# Python cache/bytecode
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Local runtime data/cache
+data/
+session.json
+world_cache.json
+**/session.json
+**/world_cache.json
+
+# Local databases
 *.db
 *.sqlite
 *.sqlite3
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Environment
 .env
 .venv/
 venv/
-data/
-*.log
