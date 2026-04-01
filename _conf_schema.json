@@ -23,6 +23,12 @@
     },
     "default": []
   },
+  "watch_self": {
+    "type": "bool",
+    "description": "是否视奸自己",
+    "hint": "开启后会将当前登录账号本人加入监控集合（仅客户端在线状态计入在线；本人位置未知/不可见时不推送位置切换噪音）。",
+    "default": false
+  },
   "enable_status_tracking": {
     "type": "bool",
     "description": "是否追踪状态变化",

@@ -28,10 +28,11 @@ class SettingsRepository:
     def initialize(self) -> None:
         if self._initialized:
             return
-        conn = sqlite3.connect(self.cfg.db_path)
+        conn = sqlite3.connect(self.cfg.db_path, timeout=10)
         try:
             conn.execute(self.SETTINGS_TABLE_SQL)
             conn.execute(self.TRANSLATION_TABLE_SQL)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_world_desc_translations_updated_at ON world_desc_translations(updated_at DESC)")
             conn.commit()
             self._initialized = True
         finally:
@@ -45,7 +46,7 @@ class SettingsRepository:
     def _parse_csv(raw: str | None) -> list[str]:
         if not raw:
             return []
-        return [item for item in raw.split(",") if item]
+        return [item.strip() for item in raw.split(",") if item and item.strip()]
 
     @staticmethod
     def _dump_csv(items: list[str]) -> str:
@@ -69,7 +70,7 @@ class SettingsRepository:
 
     def _get_raw(self, key: str) -> str | None:
         self._ensure_table()
-        conn = sqlite3.connect(self.cfg.db_path)
+        conn = sqlite3.connect(self.cfg.db_path, timeout=10)
         try:
             row = conn.execute(
                 "SELECT setting_value FROM plugin_settings WHERE setting_key = ?", (key,)
@@ -80,7 +81,7 @@ class SettingsRepository:
 
     def _set_raw(self, key: str, value: str) -> None:
         self._ensure_table()
-        conn = sqlite3.connect(self.cfg.db_path)
+        conn = sqlite3.connect(self.cfg.db_path, timeout=10)
         try:
             conn.execute(
                 "INSERT INTO plugin_settings (setting_key, setting_value) VALUES (?, ?) "
@@ -164,7 +165,7 @@ class SettingsRepository:
         source_desc = (source_desc or "").strip()
         if not world_id or not source_desc:
             return None
-        conn = sqlite3.connect(self.cfg.db_path)
+        conn = sqlite3.connect(self.cfg.db_path, timeout=10)
         try:
             row = conn.execute(
                 "SELECT translated_desc FROM world_desc_translations WHERE world_id = ? AND source_desc = ?",
@@ -183,7 +184,7 @@ class SettingsRepository:
         translated_desc = (translated_desc or "").strip()
         if not world_id or not source_desc or not translated_desc:
             return
-        conn = sqlite3.connect(self.cfg.db_path)
+        conn = sqlite3.connect(self.cfg.db_path, timeout=10)
         try:
             conn.execute(
                 """
@@ -227,7 +228,7 @@ class SearchRepository:
         keyword = (keyword or "").strip()
         if not keyword:
             return 0, []
-        conn = sqlite3.connect(self.cfg.db_path)
+        conn = sqlite3.connect(self.cfg.db_path, timeout=10)
         try:
             like_keyword = f"%{keyword}%"
             total_row = conn.execute(
@@ -235,18 +236,20 @@ class SearchRepository:
                 (like_keyword, like_keyword),
             ).fetchone()
             total = int(total_row[0]) if total_row else 0
+            safe_limit = max(1, min(int(limit), 200))
+            safe_offset = max(0, int(offset))
             rows = conn.execute(
                 "SELECT friend_user_id, display_name, status, location, status_description, updated_at "
                 "FROM friend_snapshots WHERE display_name LIKE ? OR friend_user_id LIKE ? "
                 "ORDER BY updated_at DESC, display_name ASC LIMIT ? OFFSET ?",
-                (like_keyword, like_keyword, limit, offset),
+                (like_keyword, like_keyword, safe_limit, safe_offset),
             ).fetchall()
             return total, [self._snapshot_from_row(row) for row in rows]
         finally:
             conn.close()
 
     def count_cached_friends(self) -> int:
-        conn = sqlite3.connect(self.cfg.db_path)
+        conn = sqlite3.connect(self.cfg.db_path, timeout=10)
         try:
             row = conn.execute("SELECT COUNT(*) FROM friend_snapshots").fetchone()
             return int(row[0]) if row else 0

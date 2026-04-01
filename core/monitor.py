@@ -48,6 +48,7 @@ class MonitorService:
         self._last_coroom_notify_at: dict[str, float] = {}
         self._last_seen_raw_notify_groups = self._dedupe_clean_ids(self.cfg.read_notify_group_ids_from_raw())
         self._last_seen_raw_watch_friends = self._dedupe_clean_ids(self.cfg.read_watch_friend_ids_from_raw())
+        self._stop_event = asyncio.Event()
 
     async def try_restore_session(self) -> bool:
         data = self.session_store.load()
@@ -115,11 +116,24 @@ class MonitorService:
                 result = runtime_friend_ids
 
         self._last_seen_raw_watch_friends = self._dedupe_clean_ids(self.cfg.read_watch_friend_ids_from_raw())
+        self._stop_event = asyncio.Event()
+
+        # 监控列表对外展示时，watch_self=true 需体现到 effective list（不写回配置/数据库）
+        if self.cfg.watch_self:
+            self_id = (self.client.get_current_user_id() or '').strip()
+            if self_id:
+                result = self._dedupe_clean_ids([*result, self_id])
         return result
 
     def get_monitor_watch_friend_ids(self) -> list[str]:
-        """监控语义统一入口：仅对监控名单生效，空名单即不监控。"""
+        """监控语义统一入口：监控名单 + 可选本人。"""
+        # get_effective_watch_friends 已处理 watch_self 的可见性，这里仅做一次去重。
         return self._dedupe_clean_ids(self.get_effective_watch_friends())
+
+    @staticmethod
+    def _should_track_self_location_change(old_location: str | None, new_location: str | None) -> bool:
+        # 本人监控时，location 不可见/未知/私密等场景噪声较高，仅跟踪可识别世界实例之间的切换
+        return bool(get_location_group_key(old_location)) and bool(get_location_group_key(new_location))
 
     @staticmethod
     def _dedupe_clean_ids(friend_ids: list[str] | None) -> list[str]:
@@ -137,11 +151,13 @@ class MonitorService:
         if self._running:
             return
         self._running = True
+        self._stop_event.clear()
         await self.try_restore_session()
         self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
         if self._task:
             self._task.cancel()
             try:
@@ -158,9 +174,15 @@ class MonitorService:
             self._cleanup_pending_logins()
             if self.cfg.allow_auto_push and self.client.is_logged_in():
                 try:
-                    events = await self.detect_changes()
+                    detect_timeout = max(10, min(self.cfg.poll_interval_seconds - 5, 120))
+                    events = await asyncio.wait_for(self.detect_changes(), timeout=detect_timeout)
                     if events and self._event_callback:
-                        await self._event_callback(events)
+                        try:
+                            await self._event_callback(events)
+                        except Exception as exc:
+                            logger.error(f"[vrc_friend_radar] 事件回调执行失败: {exc}", exc_info=True)
+                except asyncio.TimeoutError:
+                    logger.error("[vrc_friend_radar] 轮询检测超时，已跳过本轮")
                 except Exception as exc:
                     logger.error(f"[vrc_friend_radar] 轮询检测失败: {exc}", exc_info=True)
             if self._loop_tick_callback:
@@ -168,7 +190,11 @@ class MonitorService:
                     await self._loop_tick_callback(datetime.now())
                 except Exception as exc:
                     logger.error(f"[vrc_friend_radar] 轮询Tick回调执行失败: {exc}", exc_info=True)
-            await asyncio.sleep(self.cfg.poll_interval_seconds)
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=max(1, self.cfg.poll_interval_seconds))
+                break
+            except asyncio.TimeoutError:
+                continue
 
     async def test_login(self, username: str, password: str, two_factor_code: str | None = None) -> LoginResult:
         result = await self.client.login(username=username, password=password, two_factor_code=two_factor_code)
@@ -186,8 +212,40 @@ class MonitorService:
     def get_sync_debug(self) -> dict[str, int]:
         return self.client.get_last_sync_debug()
 
+    async def _resolve_self_context(self) -> tuple[str, FriendSnapshot | None]:
+        """
+        解析本轮监控所需的本人信息。
+        - watch_self=False: 直接跳过；
+        - watch_self=True 且 current_user_id 为空: 主动请求当前用户快照以刷新 user_id；
+        返回：(self_user_id, self_snapshot)
+        """
+        if not self.cfg.watch_self:
+            return '', None
+
+        self_id = (self.client.get_current_user_id() or '').strip()
+        self_snapshot: FriendSnapshot | None = None
+        if self_id:
+            return self_id, None
+
+        # 关键兜底：某些恢复登录/重启场景下 current_user_id 可能为空，主动拉取一次本人快照
+        self_snapshot = await self.client.fetch_self_snapshot()
+        if self_snapshot is not None:
+            self_id = (self_snapshot.friend_user_id or '').strip()
+
+        if not self_id:
+            logger.warning('[vrc_friend_radar] watch_self=true 但当前无法获取 current_user_id，本轮仅监控普通好友')
+        else:
+            logger.info('[vrc_friend_radar] watch_self=true 且 current_user_id 缺失，已通过 fetch_self_snapshot() 刷新')
+        return self_id, self_snapshot
+
     async def detect_changes(self) -> list[RadarEvent]:
-        watch_ids = self.get_monitor_watch_friend_ids()
+        base_watch_ids = self._dedupe_clean_ids(self.get_effective_watch_friends())
+        resolved_self_id, self_snapshot = await self._resolve_self_context()
+
+        watch_ids = base_watch_ids
+        if resolved_self_id:
+            watch_ids = self._dedupe_clean_ids([*watch_ids, resolved_self_id])
+
         if not watch_ids:
             logger.info("[vrc_friend_radar] 本轮变化检测跳过：监控名单为空")
             self._last_sync_count = 0
@@ -198,6 +256,16 @@ class MonitorService:
         old_map_all = self.db.get_friend_snapshot_map()
         old_map = {friend_id: old_map_all[friend_id] for friend_id in watch_ids if friend_id in old_map_all}
         new_snapshots = await self.client.fetch_friend_snapshots(watch_ids)
+
+        if resolved_self_id and resolved_self_id in watch_set:
+            if self_snapshot is None:
+                self_snapshot = await self.client.fetch_self_snapshot()
+            if self_snapshot is not None and (self_snapshot.friend_user_id or '').strip():
+                # 以当前登录账号实时快照为准，覆盖同ID项（理论上好友列表不应包含自己）
+                merged = {item.friend_user_id: item for item in new_snapshots}
+                merged[self_snapshot.friend_user_id] = self_snapshot
+                new_snapshots = list(merged.values())
+
         new_snapshots = [item for item in new_snapshots if item.friend_user_id in watch_set]
 
         raw_events: list[RadarEvent] = []
@@ -210,6 +278,7 @@ class MonitorService:
         filtered_events: list[RadarEvent] = []
         skipped_status_events = 0
         skipped_world_events = 0
+        current_self_id = resolved_self_id or (self.client.get_current_user_id() or '').strip()
         for event in raw_events:
             if event.event_type in {"friend_online", "friend_offline", "status_changed", "status_message_changed"}:
                 if not self.cfg.enable_status_tracking:
@@ -217,6 +286,9 @@ class MonitorService:
                     continue
             if event.event_type == "location_changed":
                 if not self.cfg.enable_world_tracking:
+                    skipped_world_events += 1
+                    continue
+                if current_self_id and event.friend_user_id == current_self_id and not self._should_track_self_location_change(event.old_value, event.new_value):
                     skipped_world_events += 1
                     continue
             filtered_events.append(event)
@@ -268,11 +340,11 @@ class MonitorService:
                 continue
             if joinable_only and infer_joinability(location_key) != '可加入':
                 continue
-            active_location_keys.append(location_key)
             members.sort(key=lambda x: x.friend_user_id)
             signature = '|'.join(item.friend_user_id for item in members)
             old_signature = self.db.get_coroom_signature(location_key)
             self.db.set_coroom_signature(location_key, signature, now)
+            active_location_keys.append(location_key)
             if old_signature == signature:
                 continue
             display_names = '、'.join(sorted(item.display_name for item in members))

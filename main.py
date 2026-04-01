@@ -118,7 +118,22 @@ class VRCFriendRadarPlugin(Star):
             sender_id = str(event.get_sender_id())
         except Exception:
             pass
-        return f"{event.unified_msg_origin}:{sender_id}"
+
+        origin = None
+        for attr in ("unified_msg_origin", "session_id", "message_type"):
+            try:
+                value = getattr(event, attr, None)
+                if value:
+                    origin = str(value)
+                    break
+            except Exception:
+                continue
+
+        if not origin:
+            group_id = self._get_group_id(event)
+            origin = f"group:{group_id}" if group_id else "private"
+
+        return f"{origin}:{sender_id}"
 
     def _cleanup_search_sessions(self) -> None:
         expired = [key for key, session in self._search_sessions.items() if session.is_expired(self.cfg.search_result_ttl_seconds)]
@@ -134,15 +149,45 @@ class VRCFriendRadarPlugin(Star):
         return self._search_sessions.get(session_key)
 
     def _get_group_id(self, event: AiocqhttpMessageEvent) -> str | None:
+        # aiocqhttp 在不同事件类型下字段位置不完全一致，这里做兼容兜底。
         try:
-            if getattr(event.message_obj, 'group_id', None):
-                return str(event.message_obj.group_id)
+            message_obj = getattr(event, "message_obj", None)
+            group_id = getattr(message_obj, "group_id", None)
+            if group_id:
+                return str(group_id)
+        except Exception:
+            pass
+
+        for attr in ("group_id",):
+            try:
+                value = getattr(event, attr, None)
+                if value:
+                    return str(value)
+            except Exception:
+                continue
+
+        try:
+            session_id = getattr(event, "session_id", None)
+            if isinstance(session_id, str) and session_id.startswith("group_"):
+                return session_id.split("_", 1)[1]
         except Exception:
             pass
         return None
 
     def _is_private_event(self, event: AiocqhttpMessageEvent) -> bool:
         return self._get_group_id(event) is None
+
+    def _sanitize_display_name_for_output(self, name: str | None) -> str:
+        text = str(name or '').strip()
+        if not text:
+            return '未知好友'
+        text = re.sub(r"（\s*usr_[^）]+\s*）", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\(\s*usr_[^)]+\s*\)", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*/\s*usr_[A-Za-z0-9_-]+", "", text, flags=re.IGNORECASE)
+        text = text.strip(' -|，,')
+        if re.fullmatch(r"usr_[A-Za-z0-9_-]+", text, flags=re.IGNORECASE):
+            return '未知好友'
+        return text or '未知好友'
 
     async def _build_online_friend_list_message(self, page: int = 1) -> str:
         page = max(1, page)
@@ -164,7 +209,8 @@ class VRCFriendRadarPlugin(Star):
                 else:
                     cache_misses += 1
             world_text = await self._format_world_display(item.location)
-            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {world_text} | {infer_joinability(item.location, status=item.status)}")
+            shown_name = self._sanitize_display_name_for_output(item.display_name)
+            lines.append(f"{idx}. {shown_name} | 状态: {item.status or 'unknown'} | 地图: {world_text} | {infer_joinability(item.location, status=item.status)}")
         logger.info(f"[vrc_friend_radar] 在线好友列表世界解析完成: total={len(snapshots)}, cache_hits={cache_hits}, cache_misses={cache_misses}")
         if page < total_pages:
             lines.append(f"下一页可用：/vrc在线好友 {page + 1}")
@@ -266,8 +312,9 @@ class VRCFriendRadarPlugin(Star):
                     if current
                     else '未知位置'
                 )
+                shown_name = self._sanitize_display_name_for_output(item.display_name)
                 messages.append(
-                    f"🟢 {item.display_name} 上线啦 | 状态：{item.new_value or 'unknown'} | 位置：{world_text} | {joinability}"
+                    f"🟢 {shown_name} 上线啦 | 状态：{item.new_value or 'unknown'} | 位置：{world_text} | {joinability}"
                 )
                 continue
             if item.event_type == 'co_room':
@@ -374,7 +421,7 @@ class VRCFriendRadarPlugin(Star):
         if not stats:
             return "未知"
         parts = []
-        for key in ("可加入", "需邀请", "不可加入", "未知"):
+        for key in ("可加入", "不可进入", "未知"):
             count = int(stats.get(key, 0))
             if count > 0:
                 parts.append(f"{key}{count}")
@@ -523,8 +570,10 @@ class VRCFriendRadarPlugin(Star):
         if active_counter:
             lines.append(f"今日活跃好友 Top {top_n}：")
             for idx, (friend_id, cnt) in enumerate(active_counter.most_common(top_n), start=1):
-                display = snapshot_map.get(friend_id).display_name if snapshot_map.get(friend_id) else friend_id
-                lines.append(f"{idx}. {display}（{friend_id}）- 事件 {cnt}")
+                snapshot = snapshot_map.get(friend_id)
+                display = self._sanitize_display_name_for_output(snapshot.display_name if snapshot else '')
+                shown_name = display or '未知好友'
+                lines.append(f"{idx}. {shown_name} - 事件 {cnt}")
         else:
             lines.append("今日活跃好友 Top：暂无可用事件数据。")
 
@@ -682,7 +731,16 @@ class VRCFriendRadarPlugin(Star):
         if not items:
             yield event.plain_result("当前监控好友列表为空。监控提醒/监控事件/同房提醒将不会产生；好友列表与搜索仍可查看全好友缓存。")
             return
-        yield event.plain_result("监控好友列表：\n" + "\n".join(items))
+
+        snapshot_map = self.db.get_friend_snapshot_map()
+        lines: list[str] = []
+        for idx, friend_id in enumerate(items, start=1):
+            snapshot = snapshot_map.get(friend_id)
+            display_name = self._sanitize_display_name_for_output(snapshot.display_name if snapshot else '')
+            shown_name = display_name or friend_id
+            lines.append(f"{idx}. {shown_name}")
+
+        yield event.plain_result("监控好友列表：\n" + "\n".join(lines))
 
     @filter.command("vrc搜索地图")
     async def search_worlds(self, event: AiocqhttpMessageEvent):
@@ -748,7 +806,8 @@ class VRCFriendRadarPlugin(Star):
         total_pages = max(1, math.ceil(total / page_size))
         lines = [f"在 {total_cached} 个缓存好友中搜索到 {total} 个结果，当前第 {page}/{total_pages} 页："]
         for idx, item in enumerate(items, start=1):
-            lines.append(f"{idx}. {item.display_name} | ID: {item.friend_user_id} | 状态: {item.status or 'unknown'} | 位置: {format_location(item.location)} | {infer_joinability(item.location, status=item.status)}")
+            shown_name = self._sanitize_display_name_for_output(item.display_name)
+            lines.append(f"{idx}. {shown_name} | ID: {item.friend_user_id} | 状态: {item.status or 'unknown'} | 位置: {format_location(item.location)} | {infer_joinability(item.location, status=item.status)}")
         lines.append("可使用：/vrc添加监控序号 1")
         if total_pages > page:
             lines.append(f"下一页可用：/vrc搜索好友 {keyword} {page + 1}")
@@ -773,7 +832,8 @@ class VRCFriendRadarPlugin(Star):
         target = session.items[index - 1]
         self.settings_repo.add_watch_friend(target.friend_user_id)
         _, items = self._sync_runtime_config_lists_from_repo()
-        yield event.plain_result(f"已添加监控好友：{target.display_name} | {target.friend_user_id}，当前监控数量：{len(items)}")
+        shown_name = self._sanitize_display_name_for_output(target.display_name)
+        yield event.plain_result(f"已添加监控好友：{shown_name} | {target.friend_user_id}，当前监控数量：{len(items)}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc登录")
@@ -790,11 +850,21 @@ class VRCFriendRadarPlugin(Star):
         password = parts[1].strip()
         session_key = self._build_session_key(event)
         timeout_seconds = self.cfg.login_session_timeout_seconds
+        yield event.plain_result("已收到登录请求，正在连接 VRChat，请稍候…")
+        login_task = asyncio.create_task(self.monitor.test_login(username=username, password=password))
         try:
-            result = await self.monitor.test_login(username=username, password=password)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(login_task), timeout=10)
+            except asyncio.TimeoutError:
+                yield event.plain_result("登录请求处理中，VRChat 可能响应较慢，请继续稍候…")
+                result = await asyncio.wait_for(asyncio.shield(login_task), timeout=40)
             yield event.plain_result(f"VRChat 登录成功\n用户ID: {result.user_id}\n显示名: {result.display_name}")
             for message in await self._post_login_auto_sync_and_reply(event):
                 yield event.plain_result(message)
+        except asyncio.TimeoutError:
+            login_task.cancel()
+            logger.error("[vrc_friend_radar] 登录流程超时（>50s）")
+            yield event.plain_result("登录请求超时（等待超过 50 秒），请稍后重试。若持续超时，请检查网络或 VRChat 服务状态。")
         except VRChatTwoFactorRequiredError as exc:
             self.monitor.create_pending_login(session_key=session_key, username=username, password=password, method=exc.method)
             if exc.method == "totp_or_recovery":
@@ -807,10 +877,16 @@ class VRCFriendRadarPlugin(Star):
         except VRChatClientError as exc:
             logger.error(f"[vrc_friend_radar] 登录失败: {exc}")
             yield event.plain_result(f"VRChat 登录失败：{exc}")
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 登录流程发生未预期异常: {exc}")
+            yield event.plain_result("登录流程异常，请稍后重试或查看日志。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc验证码")
     async def submit_code(self, event: AiocqhttpMessageEvent):
+        if self._get_group_id(event):
+            yield event.plain_result("为了账号安全，请私聊 Bot 发送验证码，不要在群里发送。")
+            return
         code = event.message_str.replace("vrc验证码", "", 1).strip()
         if not code:
             yield event.plain_result("用法：/vrc验证码 123456")
@@ -820,15 +896,30 @@ class VRCFriendRadarPlugin(Star):
         if not pending:
             yield event.plain_result("当前没有等待验证的登录会话，请先发送：/vrc登录 用户名 密码")
             return
+        yield event.plain_result("已收到验证码，正在提交验证，请稍候…")
+        login_task = asyncio.create_task(
+            self.monitor.test_login(username=pending.username, password=pending.password, two_factor_code=code)
+        )
         try:
-            result = await self.monitor.test_login(username=pending.username, password=pending.password, two_factor_code=code)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(login_task), timeout=10)
+            except asyncio.TimeoutError:
+                yield event.plain_result("验证码验证处理中，VRChat 可能响应较慢，请继续稍候…")
+                result = await asyncio.wait_for(asyncio.shield(login_task), timeout=40)
             self.monitor.pop_pending_login(session_key)
             yield event.plain_result(f"VRChat 登录成功\n用户ID: {result.user_id}\n显示名: {result.display_name}")
             for message in await self._post_login_auto_sync_and_reply(event):
                 yield event.plain_result(message)
+        except asyncio.TimeoutError:
+            login_task.cancel()
+            logger.error("[vrc_friend_radar] 验证码流程超时（>50s）")
+            yield event.plain_result("验证码验证超时（等待超过 50 秒），请稍后重试 /vrc验证码。若仍失败，可重新执行 /vrc登录。")
         except VRChatClientError as exc:
             logger.error(f"[vrc_friend_radar] 验证码登录失败: {exc}")
             yield event.plain_result(f"验证码登录失败：{exc}，你可以直接重新发送 /vrc验证码 123456 重试。")
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 验证码流程发生未预期异常: {exc}")
+            yield event.plain_result("验证码处理异常，请稍后重试或重新执行 /vrc登录。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc同步好友")
@@ -852,7 +943,8 @@ class VRCFriendRadarPlugin(Star):
             return
         lines = [f"好友同步完成，本次写入 {len(snapshots)} 人，当前缓存总数 {total_cached} 人。", f"在线批次返回: {debug.get('online_batch_total', 0)} | 离线批次返回: {debug.get('offline_batch_total', 0)} | 合并后数量: {debug.get('merged_total', 0)}"]
         for idx, item in enumerate(preview, start=1):
-            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {format_location(item.location)} | {infer_joinability(item.location, status=item.status)}")
+            shown_name = self._sanitize_display_name_for_output(item.display_name)
+            lines.append(f"{idx}. {shown_name} | 状态: {item.status or 'unknown'} | 地图: {format_location(item.location)} | {infer_joinability(item.location, status=item.status)}")
         if len(snapshots) > len(preview):
             lines.append("更多好友请使用 /vrc好友列表 1 查看。")
         yield event.plain_result("\n".join(lines))
@@ -872,7 +964,8 @@ class VRCFriendRadarPlugin(Star):
         total_pages = max(1, math.ceil(total_cached / page_size))
         lines = [f"当前缓存好友总数 {total_cached} 人，当前第 {page}/{total_pages} 页："]
         for idx, item in enumerate(snapshots, start=1):
-            lines.append(f"{idx}. {item.display_name} | 状态: {item.status or 'unknown'} | 地图: {format_location(item.location)} | {infer_joinability(item.location, status=item.status)}")
+            shown_name = self._sanitize_display_name_for_output(item.display_name)
+            lines.append(f"{idx}. {shown_name} | 状态: {item.status or 'unknown'} | 地图: {format_location(item.location)} | {infer_joinability(item.location, status=item.status)}")
         if page < total_pages:
             lines.append(f"下一页可用：/vrc好友列表 {page + 1}")
         yield event.plain_result("\n".join(lines))
@@ -882,7 +975,13 @@ class VRCFriendRadarPlugin(Star):
     async def online_friend_list(self, event: AiocqhttpMessageEvent):
         raw = event.message_str.replace("vrc在线好友", "", 1).strip()
         page = int(raw) if raw.isdigit() else 1
-        yield event.plain_result(await self._build_online_friend_list_message(page=page))
+        try:
+            yield event.plain_result(await self._build_online_friend_list_message(page=page))
+        except VRChatClientError as exc:
+            yield event.plain_result(f"获取在线好友失败：{exc}")
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 查询在线好友异常: {exc}")
+            yield event.plain_result("获取在线好友时发生异常，请稍后重试。")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc检测变化")
@@ -908,7 +1007,7 @@ class VRCFriendRadarPlugin(Star):
         lines = [f"当前同房实例 {len(groups)} 个："]
         for idx, group in enumerate(groups, start=1):
             members = group.get('members', [])
-            names = [item.display_name for item in members]
+            names = [self._sanitize_display_name_for_output(item.display_name) for item in members]
             location_key = group.get('location_key', '')
             world_text = await self._format_world_display(location_key)
             joinability = infer_joinability(location_key)
@@ -920,7 +1019,15 @@ class VRCFriendRadarPlugin(Star):
         raw = event.message_str.replace("vrc热门世界", "", 1).strip()
         top_n = int(raw) if raw.isdigit() else self.cfg.daily_report_top_n
         top_n = max(1, min(20, top_n))
-        items = await self._collect_hot_world_stats_today(top_n=top_n)
+        try:
+            items = await self._collect_hot_world_stats_today(top_n=top_n)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"获取热门世界失败：{exc}")
+            return
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 统计热门世界异常: {exc}")
+            yield event.plain_result("获取热门世界时发生异常，请稍后重试。")
+            return
         if not items:
             yield event.plain_result("今日暂无热门世界统计数据（今日暂无上线好友）。")
             return

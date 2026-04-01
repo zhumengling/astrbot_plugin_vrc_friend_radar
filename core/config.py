@@ -13,6 +13,7 @@ class PluginConfig:
     poll_interval_seconds: int = 180
     notify_group_ids: list[str] = field(default_factory=list)
     watch_friend_ids: list[str] = field(default_factory=list)
+    watch_self: bool = False
     enable_status_tracking: bool = True
     enable_world_tracking: bool = True
     vrchat_user_agent: str = "AstrBotVRCFriendRadar/0.1.0 contact@example.com"
@@ -37,6 +38,7 @@ class PluginConfig:
         self.poll_interval_seconds = max(60, self._read_int("poll_interval_seconds", 180))
         self.notify_group_ids = self._normalize_str_list(self._read_list("notify_group_ids", []))
         self.watch_friend_ids = self._normalize_str_list(self._read_list("watch_friend_ids", []))
+        self.watch_self = self._read_bool("watch_self", False)
         self.enable_status_tracking = self._read_bool("enable_status_tracking", True)
         self.enable_world_tracking = self._read_bool("enable_world_tracking", True)
         self.vrchat_user_agent = str(
@@ -45,9 +47,9 @@ class PluginConfig:
                 "AstrBotVRCFriendRadar/0.1.0 contact@example.com",
             )
         ).strip()
-        self.login_session_timeout_seconds = max(30, self._read_int("login_session_timeout_seconds", 30))
+        self.login_session_timeout_seconds = max(30, min(600, self._read_int("login_session_timeout_seconds", 30)))
         self.event_dedupe_window_seconds = max(30, self._read_int("event_dedupe_window_seconds", 300))
-        self.event_batch_size = max(1, self._read_int("event_batch_size", 10))
+        self.event_batch_size = max(1, min(50, self._read_int("event_batch_size", 10)))
         self.allow_auto_push = self._read_bool("allow_auto_push", True)
         self.notify_location_detail = self._read_bool("notify_location_detail", True)
         self.search_result_ttl_seconds = max(30, self._read_int("search_result_ttl_seconds", 120))
@@ -119,7 +121,8 @@ class PluginConfig:
             text = value.strip()
             if not text:
                 return []
-            return [item.strip() for item in text.split(',') if item.strip()]
+            parts = text.replace('|', ',').replace('，', ',').split(',')
+            return [item.strip() for item in parts if item.strip()]
         return list(default)
 
     @staticmethod

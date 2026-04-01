@@ -16,14 +16,20 @@ class WorldCache:
             self._cache = {}
             return
         try:
-            self._cache = json.loads(self.file_path.read_text(encoding='utf-8'))
+            data = json.loads(self.file_path.read_text(encoding='utf-8'))
+            self._cache = data if isinstance(data, dict) else {}
+            if not isinstance(data, dict):
+                logger.warning("[vrc_friend_radar] world_cache.json 格式异常（非对象），已重置为空")
         except Exception as exc:
             logger.error(f"[vrc_friend_radar] 读取 world_cache.json 失败: {exc}", exc_info=True)
             self._cache = {}
 
     def save(self) -> None:
         try:
-            self.file_path.write_text(json.dumps(self._cache, ensure_ascii=False, indent=2), encoding='utf-8')
+            payload = json.dumps(self._cache, ensure_ascii=False, indent=2)
+            tmp_path = self.file_path.with_suffix('.json.tmp')
+            tmp_path.write_text(payload, encoding='utf-8')
+            tmp_path.replace(self.file_path)
         except Exception as exc:
             logger.error(f"[vrc_friend_radar] 写入 world_cache.json 失败: {exc}", exc_info=True)
 
@@ -31,5 +37,8 @@ class WorldCache:
         return self._cache.get(world_id)
 
     def set(self, world_id: str, data: dict) -> None:
-        self._cache[world_id] = data
+        key = str(world_id or '').strip()
+        if not key:
+            return
+        self._cache[key] = data or {}
         self.save()

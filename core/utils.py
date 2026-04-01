@@ -23,39 +23,52 @@ def get_location_group_key(location: str | None) -> str:
     return world_id if world_id else ""
 
 
+def _parse_instance_access_mode(location: str | None) -> str:
+    """Return normalized access mode for instance part.
+
+    possible values: public / hidden / friends / private / group / unknown
+    """
+    if not location:
+        return 'unknown'
+    text = str(location).strip().lower()
+    if ':' not in text:
+        return 'unknown'
+    instance_part = text.split(':', 1)[1]
+
+    if '~public' in instance_part:
+        return 'public'
+    if '~hidden' in instance_part:
+        return 'hidden'  # friends+
+    if '~friends' in instance_part:
+        return 'friends'
+    if '~private' in instance_part:
+        return 'private'  # invite / invite+
+    if '~group' in instance_part:
+        return 'group'
+    return 'unknown'
+
+
 def infer_joinability(location: str | None, status: str | None = None) -> str:
     status_text = (status or '').strip().lower()
     if status_text == 'offline':
-        return '不可加入'
+        return '不可进入'
 
     if not location:
         return '未知'
 
-    text = str(location).strip()
-    lowered = text.lower()
-
-    if lowered == 'offline':
-        return '不可加入'
+    lowered = str(location).strip().lower()
+    if lowered in {'offline', 'private'}:
+        return '不可进入'
     if lowered in {'unknown', 'traveling'}:
         return '未知'
-    if lowered == 'private':
-        return '不可加入'
 
-    if ':' not in text:
+    mode = _parse_instance_access_mode(location)
+    if mode in {'public', 'hidden', 'friends'}:
+        return '可加入'
+    if mode == 'private':
+        return '不可进入'
+    if mode == 'group':
         return '未知'
-
-    instance_part = text.split(':', 1)[1].lower()
-    if '~public' in instance_part:
-        return '可加入'
-    if '~friends' in instance_part:
-        return '可加入'
-    if '~private' in instance_part:
-        return '不可加入'
-    if '~hidden' in instance_part:
-        return '不可加入'
-    if '~group' in instance_part:
-        return '需邀请'
-
     return '未知'
 
 
@@ -69,7 +82,7 @@ def format_location(location: str | None) -> str:
     if lowered == 'offline':
         return '离线'
     if lowered == 'private':
-        return '私密'
+        return '仅限邀请'
     if lowered == 'traveling':
         return '旅行中'
     if lowered == 'unknown':
@@ -80,17 +93,16 @@ def format_location(location: str | None) -> str:
             return '某个世界'
         return text
 
-    _, instance_part = text.split(':', 1)
-
-    if '~hidden' in instance_part:
-        return '隐藏实例'
-    if '~friends' in instance_part:
-        return '好友实例'
-    if '~private' in instance_part:
-        return '私有实例'
-    if '~group' in instance_part:
+    mode = _parse_instance_access_mode(text)
+    if mode == 'hidden':
+        return '好友+实例'
+    if mode == 'friends':
+        return '仅限好友实例'
+    if mode == 'private':
+        return '仅限邀请实例'
+    if mode == 'group':
         return '群组实例'
-    if '~public' in instance_part:
+    if mode == 'public':
         return '公开实例'
 
     return '世界实例'
