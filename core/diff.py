@@ -28,16 +28,19 @@ def diff_snapshot(old: FriendSnapshot, new: FriendSnapshot) -> list[RadarEvent]:
         )
 
     if old_location != new_location:
-        events.append(
-            RadarEvent(
-                friend_user_id=new.friend_user_id,
-                display_name=new.display_name,
-                event_type="location_changed",
-                old_value=old.location,
-                new_value=new.location,
-                created_at=new.updated_at,
+        # 边界收敛：当双方都处于离线态时，location 字段可能出现脏值/抖动（offline/private/null/world 残留），
+        # 不应产生切图事件，避免误报。
+        if not (old_status == "offline" and new_status == "offline"):
+            events.append(
+                RadarEvent(
+                    friend_user_id=new.friend_user_id,
+                    display_name=new.display_name,
+                    event_type="location_changed",
+                    old_value=old.location,
+                    new_value=new.location,
+                    created_at=new.updated_at,
+                )
             )
-        )
 
     if (old.status_description or "") != (new.status_description or ""):
         events.append(

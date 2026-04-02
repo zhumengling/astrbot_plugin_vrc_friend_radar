@@ -284,6 +284,21 @@ class MonitorService:
                 if not self.cfg.enable_status_tracking:
                     skipped_status_events += 1
                     continue
+                if (
+                    current_self_id
+                    and event.friend_user_id == current_self_id
+                    and event.event_type in {"friend_online", "friend_offline", "status_changed"}
+                ):
+                    old_status = str(event.old_value or '').strip().lower()
+                    new_status = str(event.new_value or '').strip().lower()
+                    if {old_status, new_status}.issubset({'offline', 'web_online'}):
+                        skipped_status_events += 1
+                        logger.info(
+                            "[vrc_friend_radar] self status web-presence transition suppressed: old=%s, new=%s",
+                            event.old_value,
+                            event.new_value,
+                        )
+                        continue
             if event.event_type == "location_changed":
                 if not self.cfg.enable_world_tracking:
                     skipped_world_events += 1

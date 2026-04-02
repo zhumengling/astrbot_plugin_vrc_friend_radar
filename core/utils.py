@@ -13,7 +13,7 @@ def get_location_group_key(location: str | None) -> str:
         return ""
     text = str(location).strip()
     lowered = text.lower()
-    if lowered in {'offline', 'unknown', 'traveling', 'private'}:
+    if lowered in {'offline', 'unknown', 'traveling', 'travelling', 'private'}:
         return ""
     if ':' in text:
         world_part = text.split(':', 1)[0]
@@ -59,7 +59,7 @@ def infer_joinability(location: str | None, status: str | None = None) -> str:
     lowered = str(location).strip().lower()
     if lowered in {'offline', 'private'}:
         return '不可进入'
-    if lowered in {'unknown', 'traveling'}:
+    if lowered in {'unknown', 'traveling', 'travelling'}:
         return '未知'
 
     mode = _parse_instance_access_mode(location)
@@ -83,7 +83,7 @@ def format_location(location: str | None) -> str:
         return '离线'
     if lowered == 'private':
         return '仅限邀请'
-    if lowered == 'traveling':
+    if lowered in {'traveling', 'travelling'}:
         return '旅行中'
     if lowered == 'unknown':
         return '未知位置'

@@ -55,6 +55,11 @@ class VRChatClient:
         platform_text = str(platform or '').strip().lower()
         return platform_text == 'web'
 
+    @staticmethod
+    def _has_world_location(location: str | None) -> bool:
+        text = str(location or '').strip().lower()
+        return text.startswith('wrld_')
+
     def _extract_platform_info(self, user_obj) -> tuple[str, str]:
         # 返回 (platform, source)，source: presence/direct/history/last_platform
         # 仅 presence/direct 可视为“当前明确平台”；history/last_platform 仅作展示回退。
@@ -128,17 +133,32 @@ class VRChatClient:
         platform_text = self._to_text(platform).lower()
         platform_source_text = self._to_text(platform_source).lower()
         state_text = self._to_text(state).lower()
+        has_world_location = self._has_world_location(location_text)
 
-        # 仅当“当前平台字段”明确为 web 时，才折叠为 offline。
+        # 仅当“当前平台字段”明确为 web 时，才折叠为 Web 在线/离线。
         # 避免被 last_platform/platform_history 中的历史 web 误伤。
         explicit_web = self._is_web_platform(platform_text) and platform_source_text in {'presence', 'direct'}
         if explicit_web:
+            if is_self:
+                # 自我监控需要区分「Web 在线」与「客户端在线」。
+                return 'offline', 'offline'
             return 'offline', 'offline'
+
+        # 自我监控兜底：CurrentUser 里 state/status/location 可能短时不同步。
+        # 当 status 显示在线，但没有有效世界位置信息时，优先判定为 Web 在线，
+        # 避免和「真正在客户端内」混淆。
+        if is_self:
+            status_online = bool(status_text) and status_text.lower() != 'offline'
+            if status_online and not has_world_location:
+                if state_text in {'online', 'active', ''} or location_text.lower() in {'', 'offline'}:
+                    return 'offline', 'offline'
 
         if state_text == 'offline':
             # self 场景下，state 偶发滞后时，以 status/location 的实时值优先，避免误判离线。
             if is_self and status_text and status_text.lower() != 'offline':
-                return status_text, location_text
+                if has_world_location:
+                    return status_text, location_text
+                return 'offline', 'offline'
             return 'offline', 'offline'
 
         return status_text, location_text
@@ -313,7 +333,7 @@ class VRChatClient:
                     )
                     if status == 'offline' and raw_status.strip().lower() != 'offline':
                         web_filtered_count += 1
-                    dedup[friend_id] = FriendSnapshot(
+                    candidate = FriendSnapshot(
                         friend_user_id=friend_id,
                         display_name=self._to_text(getattr(friend, 'display_name', '')),
                         status=status,
@@ -321,6 +341,30 @@ class VRChatClient:
                         status_description=self._to_text(getattr(friend, 'status_description', '')),
                         updated_at=now,
                     )
+                    existing = dedup.get(friend_id)
+                    if existing is None:
+                        dedup[friend_id] = candidate
+                    else:
+                        # 同一轮分页可能出现重复记录：优先保留“在线/有世界位置信息”的快照，
+                        # 避免后续批次（尤其 offline=True）用离线态覆盖在线态导致误判。
+                        existing_status = self._to_text(existing.status).lower()
+                        candidate_status = self._to_text(candidate.status).lower()
+                        existing_has_world = self._has_world_location(existing.location)
+                        candidate_has_world = self._has_world_location(candidate.location)
+                        should_replace = False
+                        if existing_status == 'offline' and candidate_status != 'offline':
+                            should_replace = True
+                        elif existing_status != 'offline' and candidate_status == 'offline':
+                            should_replace = False
+                        elif not existing_has_world and candidate_has_world:
+                            should_replace = True
+                        elif existing_has_world and not candidate_has_world:
+                            should_replace = False
+                        else:
+                            # 信息量接近时以后到达记录为准
+                            should_replace = True
+                        if should_replace:
+                            dedup[friend_id] = candidate
                 if len(batch) < n:
                     break
                 offset += n

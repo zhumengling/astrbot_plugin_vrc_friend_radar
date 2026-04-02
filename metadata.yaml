@@ -32,7 +32,7 @@ help: |
   所有人可用命令：
   /vrc搜索好友 关键词 [页码] - 在本地好友缓存中模糊搜索
   /vrc搜索地图 关键词 - 按地图名模糊搜索 VRChat 世界
-version: 0.1.3
+version: 0.1.4
 author: zhumengling
 repo: https://github.com/zhumengling/astrbot_plugin_vrc_friend_radar
 astrbot_version: ">=4.16,<5"
