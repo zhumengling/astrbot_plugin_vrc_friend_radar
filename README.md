@@ -9,7 +9,7 @@
 ## 核心功能
 
 - VRChat 账号登录（支持 2FA：邮箱验证码 / TOTP / Recovery Code）
-- 登录态持久化与自动恢复（`session.json`）
+- 登录态持久化与自动恢复（`session.json`，仅保存 username+cookie，不保存明文密码）
 - 好友数据同步与本地缓存（SQLite）
 - 变化检测：
   - `friend_online`
@@ -219,6 +219,11 @@ pyotp>=2.9.0
 
 ### 登录/恢复行为说明（向 VRCX 靠拢）
 
+- **安全修复（本地密码落盘）**：`session.json` 现仅保存 `username` 与 `cookie`，不再写入/使用明文 `password`。检测到旧版 `password` 字段时会自动清理并覆盖落盘。
+- 自动恢复能力调整：
+  - 启动时：仍会优先尝试 `username + cookie` 的 `restore_session`；
+  - 若 cookie 失效：由于不再持久化本地密码，**不会**在重启后自动用密码重登，需管理员私聊执行 `/vrc登录`（及必要的 `/vrc验证码`）；
+  - 运行中：若当前进程内仍有登录时输入的密码，仍可继续执行自动重登/2FA 流程。
 - 登录成功判定以 Auth 成功为准：`get_current_user`（含2FA后）成功即视为登录成功，不再将 friends API 作为登录硬门槛。
 - 登录阶段若出现疑似认证污染（401/403 等），会执行一次“清 cookie + 重建 client”的单次重试（类似 VRCX clearCookiesTryLogin 思路）。
 - 启动 restore 或自动恢复 restore 失败后，会先清理旧会话状态并重建 client，再进行账号密码重登，避免脏 cookie/脏 client 反复污染。

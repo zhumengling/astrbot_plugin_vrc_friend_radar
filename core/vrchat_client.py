@@ -465,7 +465,7 @@ class VRChatClient:
     def _restore_session_sync(self, username: str, password: str, cookie: str) -> LoginResult:
         if self._api_client is not None:
             self.close()
-        if not username or not password or not cookie:
+        if not username or not cookie:
             raise VRChatClientError("缺少恢复登录态所需的信息")
         try:
             from vrchatapi.api import authentication_api
@@ -521,12 +521,13 @@ class VRChatClient:
         return ''
 
     def export_session(self) -> dict | None:
-        if self._api_client is None or not self._username or not self._password:
+        if self._api_client is None or not self._username:
             return None
         cookie = self._extract_cookie_header()
         if not cookie:
             return None
-        return {'username': self._username, 'password': self._password, 'cookie': cookie}
+        # 安全策略：不持久化明文密码，仅持久化 username + cookie
+        return {'username': self._username, 'cookie': cookie}
 
     async def fetch_friend_snapshots(self, friend_ids: list[str] | None = None) -> list[FriendSnapshot]:
         return await asyncio.to_thread(self._fetch_friend_snapshots_sync, friend_ids or [])

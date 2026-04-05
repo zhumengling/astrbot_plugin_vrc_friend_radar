@@ -104,9 +104,9 @@ class MonitorService:
         username = str(data.get('username', '') or '').strip()
         password = str(data.get('password', '') or '')
         cookie = str(data.get('cookie', '') or '').strip()
-        if not username or not password or not cookie:
-            logger.warning('[vrc_friend_radar] 启动恢复: session.json 字段不完整(username/password/cookie)，跳过 restore_session')
-            self._mark_auto_recover_result('启动未恢复', 'session.json 字段不完整(username/password/cookie)')
+        if not username or not cookie:
+            logger.warning('[vrc_friend_radar] 启动恢复: session.json 字段不完整(username/cookie)，跳过 restore_session')
+            self._mark_auto_recover_result('启动未恢复', 'session.json 字段不完整(username/cookie)')
             return False
 
         if '=' not in cookie:
@@ -390,7 +390,7 @@ class MonitorService:
             stored_password = str(stored.get('password', '') or '')
             stored_cookie = str(stored.get('cookie', '') or '').strip()
 
-            if stored_username and stored_password and stored_cookie:
+            if stored_username and stored_cookie:
                 try:
                     logger.info('[vrc_friend_radar] 自动恢复步骤 stage=restore_session start user=%s', stored_username)
                     result = await self.client.restore_session(stored_username, stored_password, stored_cookie)
@@ -415,7 +415,7 @@ class MonitorService:
             password = (password or '')
             if not username or not password:
                 username = stored_username
-                password = stored_password
+                # 安全修复后不再从 session.json 回读明文密码，仅允许使用当前进程内已保存凭据
 
             # 关键增强：不要沿用可能污染的旧client/cookie，先清理会话再重建登录
             logger.info('[vrc_friend_radar] 自动恢复步骤 stage=recreate_client start')
@@ -423,9 +423,9 @@ class MonitorService:
             logger.info('[vrc_friend_radar] 自动恢复步骤 stage=recreate_client success')
 
             if not username or not password:
-                self._mark_auto_recover_result('失败', '无可用账号密码，无法自动重登')
-                logger.error('[vrc_friend_radar] 自动恢复失败：无可用账号密码')
-                await self._emit_notice('[VRC雷达] VRChat 登录状态恢复失败：缺少可用账号密码，无法自动重登。\n请管理员私聊执行 /vrc登录。')
+                self._mark_auto_recover_result('失败', '无进程内账号密码，无法自动重登（安全策略不持久化本地密码）')
+                logger.error('[vrc_friend_radar] 自动恢复失败：无进程内账号密码（session.json 不再持久化密码）')
+                await self._emit_notice('[VRC雷达] VRChat 登录状态恢复失败：当前无可用进程内账号密码（安全策略已禁用本地明文密码持久化），无法自动重登。\n请管理员私聊执行 /vrc登录。')
                 return False
 
             try:
@@ -492,18 +492,11 @@ class MonitorService:
             self._last_session_persist_at = time.time()
         else:
             stored = self.session_store.load() or {}
-            has_stored_credentials = bool(str(stored.get('username', '') or '').strip() and str(stored.get('password', '') or '').strip())
-            if has_stored_credentials:
-                logger.warning('[vrc_friend_radar] 启动恢复: restore_session 未成功，开始自动重登兜底')
-                try:
-                    await self.auto_recover_login('插件启动阶段 restore_session 未成功，自动执行账号密码重登', source='startup_fallback')
-                except asyncio.CancelledError:
-                    self._mark_auto_recover_result('启动恢复跳过', '启动阶段自动重登被取消')
-                    logger.warning('[vrc_friend_radar] 启动恢复: 自动重登兜底被取消，插件继续加载')
-                except Exception as exc:
-                    logger.warning('[vrc_friend_radar] 启动恢复: 自动重登兜底异常，插件继续加载。err=%s', exc)
+            has_stored_session = bool(str(stored.get('username', '') or '').strip() and str(stored.get('cookie', '') or '').strip())
+            if has_stored_session:
+                logger.info('[vrc_friend_radar] 启动恢复: 已尝试基于 session.json(username+cookie) 恢复，失败后不再使用本地密码自动重登，请管理员手动 /vrc登录')
             else:
-                logger.info('[vrc_friend_radar] 启动恢复: 无可用账号密码，跳过自动重登兜底')
+                logger.info('[vrc_friend_radar] 启动恢复: 无可用 session(username+cookie)，等待管理员手动登录')
         self._task = asyncio.create_task(self._run_loop())
 
     async def stop(self) -> None:
