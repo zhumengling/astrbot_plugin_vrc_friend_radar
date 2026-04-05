@@ -217,7 +217,7 @@ pyotp>=2.9.0
 
 ---
 
-### 登录/恢复行为说明（向 VRCX 靠拢）
+### 登录/恢复行为说明
 
 - 登录成功判定以 Auth 成功为准：`get_current_user`（含2FA后）成功即视为登录成功，不再将 friends API 作为登录硬门槛。
 - 登录阶段若出现疑似认证污染（401/403 等），会执行一次“清 cookie + 重建 client”的单次重试（类似 VRCX clearCookiesTryLogin 思路）。
