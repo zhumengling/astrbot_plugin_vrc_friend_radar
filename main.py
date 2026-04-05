@@ -23,7 +23,7 @@ from .core.monitor import MonitorService
 from .core.repository import SearchRepository, SettingsRepository
 from .core.search_state import SearchSession
 from .core.utils import extract_world_id, format_location, infer_joinability
-from .core.vrchat_client import VRChatClientError, VRChatTwoFactorRequiredError
+from .core.vrchat_client import VRChatClientError, VRChatNetworkError, VRChatTwoFactorRequiredError
 from .core.world_cache import WorldCache
 
 
@@ -39,9 +39,11 @@ class VRCFriendRadarPlugin(Star):
         self.monitor = MonitorService(self.cfg, self.db, self.settings_repo)
         self.monitor.set_event_callback(self._handle_monitor_events)
         self.monitor.set_loop_tick_callback(self._handle_loop_tick)
+        self.monitor.set_notice_callback(self._handle_monitor_notice)
         self._search_sessions: dict[str, SearchSession] = {}
         self._daily_task_last_sent_date: dict[str, str] = {"daily_report": ""}
         self._translation_lock_map: dict[str, asyncio.Lock] = {}
+        self._last_private_admin_sender_id: str = ""
 
     def _reconcile_dynamic_lists_on_startup(self) -> tuple[list[str], list[str]]:
         config_notify_groups = self.cfg.read_notify_group_ids_from_raw()
@@ -66,6 +68,8 @@ class VRCFriendRadarPlugin(Star):
         return notify_groups, watch_friends
 
     async def initialize(self):
+        self._search_sessions.clear()
+        self._translation_lock_map.clear()
         self.db.initialize()
         self.settings_repo.initialize()
         merged_notify_groups, merged_watch_friends = self._reconcile_dynamic_lists_on_startup()
@@ -80,11 +84,86 @@ class VRCFriendRadarPlugin(Star):
     async def terminate(self):
         await self.monitor.stop()
         self._search_sessions.clear()
+        self._translation_lock_map.clear()
         logger.info("[vrc_friend_radar] 插件已停止")
 
     async def _handle_monitor_events(self, events) -> None:
         messages = await self._format_events_for_push(events)
         await self._push_messages_to_notify_groups(messages)
+
+    async def _handle_monitor_notice(self, message: str) -> None:
+        text = str(message or '').strip()
+        if not text:
+            return
+        await self._push_login_notice_to_admins(text)
+
+    def _remember_private_admin_sender(self, event: AiocqhttpMessageEvent) -> None:
+        if not self._is_private_event(event):
+            return
+        try:
+            sender_id = str(event.get_sender_id() or '').strip()
+        except Exception:
+            sender_id = ''
+        if sender_id:
+            self._last_private_admin_sender_id = sender_id
+
+    def _resolve_admin_notice_targets(self) -> list[str]:
+        """优先读取 AstrBot 全局 admins_id；为空时回退到最近一次私聊登录管理者。"""
+        admin_ids: list[str] = []
+        try:
+            cfg = self.context.get_config()
+            raw_admins = cfg.get('admins_id', []) if hasattr(cfg, 'get') else []
+            if isinstance(raw_admins, (list, tuple)):
+                admin_ids = [str(item or '').strip() for item in raw_admins]
+            elif isinstance(raw_admins, str):
+                admin_ids = [raw_admins.strip()]
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 读取 AstrBot admins_id 失败: {exc}")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for item in admin_ids:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+
+        if deduped:
+            return deduped
+
+        fallback = self._last_private_admin_sender_id.strip()
+        if fallback:
+            logger.warning('[vrc_friend_radar] admins_id 为空，已回退到最近私聊管理员ID进行登录告警投递。')
+            return [fallback]
+        return []
+
+    async def _send_chain_to_private_users(self, user_ids: list[str], chain: MessageChain) -> int:
+        if not user_ids:
+            return 0
+        success = 0
+        for user_id in user_ids:
+            try:
+                await StarTools.send_message_by_id(
+                    type="PrivateMessage",
+                    id=str(user_id),
+                    message_chain=chain,
+                    platform="aiocqhttp",
+                )
+                success += 1
+            except Exception as exc:
+                logger.error(f"[vrc_friend_radar] 登录告警私聊发送失败 user={user_id}: {exc}")
+        return success
+
+    async def _push_login_notice_to_admins(self, message: str) -> None:
+        text = str(message or '').strip()
+        if not text:
+            return
+        targets = self._resolve_admin_notice_targets()
+        if not targets:
+            logger.warning('[vrc_friend_radar] 登录相关告警未发送：未获取到管理员ID（admins_id为空，且无私聊后备目标）。告警内容：%s', text)
+            return
+        success = await self._send_chain_to_private_users(targets, MessageChain([Plain(text)]))
+        logger.info("[vrc_friend_radar] 登录告警已投递 admins=%s success=%s", len(targets), success)
 
     async def _send_chain_to_groups(self, chain: MessageChain) -> int:
         groups = self.monitor.get_effective_notify_groups()
@@ -641,6 +720,7 @@ class VRCFriendRadarPlugin(Star):
         if success > 0 and mark_sent:
             today = datetime.now().strftime('%Y-%m-%d')
             self._set_daily_task_last_sent_date('daily_report', today)
+        logger.info("[vrc_friend_radar] 日报推送完成: success_groups=%s mark_sent=%s", success, mark_sent)
         return success
 
     async def _handle_loop_tick(self, now: datetime) -> None:
@@ -835,19 +915,50 @@ class VRCFriendRadarPlugin(Star):
         shown_name = self._sanitize_display_name_for_output(target.display_name)
         yield event.plain_result(f"已添加监控好友：{shown_name} | {target.friend_user_id}，当前监控数量：{len(items)}")
 
+    def _parse_login_credentials(self, message_text: str) -> tuple[str, str]:
+        # 兼容旧格式：/vrc登录 用户名 密码
+        # 新逻辑：第一个参数作为用户名，其后全文原样作为密码（尽量保留空白与特殊符号）
+        raw = str(message_text or '').replace("vrc登录", "", 1)
+        payload = raw.lstrip()
+        if not payload:
+            return '', ''
+
+        # 仅按“第一个空白字符”切分一次：
+        # - 用户名：首段非空白
+        # - 密码：其后全文原样（可包含空格、#、@、:、CQ转义后的字符等）
+        split_idx = -1
+        for idx, ch in enumerate(payload):
+            if ch.isspace():
+                split_idx = idx
+                break
+        if split_idx <= 0:
+            return '', ''
+
+        username = payload[:split_idx]
+        password = payload[split_idx + 1:]
+        return username, password
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc登录")
     async def interactive_login(self, event: AiocqhttpMessageEvent):
         if self._get_group_id(event):
             yield event.plain_result("为了账号安全，请私聊 Bot 发送登录账号和密码，不要在群里发送。")
             return
-        raw = event.message_str.replace("vrc登录", "", 1).strip()
-        parts = raw.split()
-        if len(parts) < 2:
+        self._remember_private_admin_sender(event)
+        username, password = self._parse_login_credentials(event.message_str)
+        if not username or password == '':
             yield event.plain_result("用法：/vrc登录 用户名 密码")
             return
-        username = parts[0].strip()
-        password = parts[1].strip()
+        logger.info(
+            "[vrc_friend_radar] 登录命令解析: username=%s(len=%s, email_like=%s), password_len=%s, contains_ws=%s, leading_ws=%s, trailing_ws=%s",
+            username,
+            len(username),
+            ('@' in username),
+            len(password),
+            any(ch.isspace() for ch in password),
+            bool(password and password[0].isspace()),
+            bool(password and password[-1].isspace()),
+        )
         session_key = self._build_session_key(event)
         timeout_seconds = self.cfg.login_session_timeout_seconds
         yield event.plain_result("已收到登录请求，正在连接 VRChat，请稍候…")
@@ -857,14 +968,20 @@ class VRCFriendRadarPlugin(Star):
                 result = await asyncio.wait_for(asyncio.shield(login_task), timeout=10)
             except asyncio.TimeoutError:
                 yield event.plain_result("登录请求处理中，VRChat 可能响应较慢，请继续稍候…")
-                result = await asyncio.wait_for(asyncio.shield(login_task), timeout=40)
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(login_task), timeout=max(5, timeout_seconds))
+                except asyncio.TimeoutError:
+                    login_task.cancel()
+                    logger.error(f"[vrc_friend_radar] 登录任务超时(>10s + {max(5, timeout_seconds)}s)，后台线程可能阻塞")
+                    yield event.plain_result("登录长时间未完成，已停止本次等待。请稍后重试；若持续复现，请查看日志中的登录阶段(stage)定位卡点。")
+                    return
             yield event.plain_result(f"VRChat 登录成功\n用户ID: {result.user_id}\n显示名: {result.display_name}")
             for message in await self._post_login_auto_sync_and_reply(event):
                 yield event.plain_result(message)
         except asyncio.TimeoutError:
             login_task.cancel()
-            logger.error("[vrc_friend_radar] 登录流程超时（>50s）")
-            yield event.plain_result("登录请求超时（等待超过 50 秒），请稍后重试。若持续超时，请检查网络或 VRChat 服务状态。")
+            logger.error("[vrc_friend_radar] 登录流程超时（等待初始10秒提示阶段）")
+            yield event.plain_result("登录请求超时，请稍后重试。若持续超时，请检查网络或 VRChat 服务状态。")
         except VRChatTwoFactorRequiredError as exc:
             self.monitor.create_pending_login(session_key=session_key, username=username, password=password, method=exc.method)
             if exc.method == "totp_or_recovery":
@@ -876,7 +993,10 @@ class VRCFriendRadarPlugin(Star):
             yield event.plain_result(f"检测到额外验证方式 {exc.method}，请在{timeout_seconds}秒内发送：/vrc验证码 123456")
         except VRChatClientError as exc:
             logger.error(f"[vrc_friend_radar] 登录失败: {exc}")
-            yield event.plain_result(f"VRChat 登录失败：{exc}")
+            if isinstance(exc, VRChatNetworkError):
+                yield event.plain_result(f"VRChat 登录失败：网络异常或超时。\n详情：{exc}")
+            else:
+                yield event.plain_result(f"VRChat 登录失败：{exc}")
         except Exception as exc:
             logger.exception(f"[vrc_friend_radar] 登录流程发生未预期异常: {exc}")
             yield event.plain_result("登录流程异常，请稍后重试或查看日志。")
@@ -887,12 +1007,18 @@ class VRCFriendRadarPlugin(Star):
         if self._get_group_id(event):
             yield event.plain_result("为了账号安全，请私聊 Bot 发送验证码，不要在群里发送。")
             return
+        self._remember_private_admin_sender(event)
         code = event.message_str.replace("vrc验证码", "", 1).strip()
         if not code:
             yield event.plain_result("用法：/vrc验证码 123456")
             return
         session_key = self._build_session_key(event)
-        pending = self.monitor.get_pending_login(session_key)
+        pending_key = session_key
+        pending = self.monitor.get_pending_login(pending_key)
+        if not pending:
+            # 兜底：运行中自动恢复触发2FA时，允许管理员在任意私聊上下文提交验证码
+            pending_key = '__auto_recover__'
+            pending = self.monitor.get_pending_login(pending_key)
         if not pending:
             yield event.plain_result("当前没有等待验证的登录会话，请先发送：/vrc登录 用户名 密码")
             return
@@ -905,18 +1031,27 @@ class VRCFriendRadarPlugin(Star):
                 result = await asyncio.wait_for(asyncio.shield(login_task), timeout=10)
             except asyncio.TimeoutError:
                 yield event.plain_result("验证码验证处理中，VRChat 可能响应较慢，请继续稍候…")
-                result = await asyncio.wait_for(asyncio.shield(login_task), timeout=40)
-            self.monitor.pop_pending_login(session_key)
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(login_task), timeout=max(5, self.cfg.login_session_timeout_seconds))
+                except asyncio.TimeoutError:
+                    login_task.cancel()
+                    logger.error(f"[vrc_friend_radar] 验证码提交任务超时(>10s + {max(5, self.cfg.login_session_timeout_seconds)}s)，后台线程可能阻塞")
+                    yield event.plain_result("验证码提交后长时间未完成，已停止本次等待。请重试 /vrc验证码 123456，必要时重新 /vrc登录。")
+                    return
+            self.monitor.pop_pending_login(pending_key)
             yield event.plain_result(f"VRChat 登录成功\n用户ID: {result.user_id}\n显示名: {result.display_name}")
             for message in await self._post_login_auto_sync_and_reply(event):
                 yield event.plain_result(message)
         except asyncio.TimeoutError:
             login_task.cancel()
-            logger.error("[vrc_friend_radar] 验证码流程超时（>50s）")
-            yield event.plain_result("验证码验证超时（等待超过 50 秒），请稍后重试 /vrc验证码。若仍失败，可重新执行 /vrc登录。")
+            logger.error("[vrc_friend_radar] 验证码流程超时（等待初始10秒提示阶段）")
+            yield event.plain_result("验证码验证超时，请稍后重试 /vrc验证码。若仍失败，可重新执行 /vrc登录。")
         except VRChatClientError as exc:
             logger.error(f"[vrc_friend_radar] 验证码登录失败: {exc}")
-            yield event.plain_result(f"验证码登录失败：{exc}，你可以直接重新发送 /vrc验证码 123456 重试。")
+            if isinstance(exc, VRChatNetworkError):
+                yield event.plain_result(f"验证码登录失败：网络异常或超时。\n详情：{exc}\n可直接重试 /vrc验证码 123456。")
+            else:
+                yield event.plain_result(f"验证码登录失败：{exc}，你可以直接重新发送 /vrc验证码 123456 重试。")
         except Exception as exc:
             logger.exception(f"[vrc_friend_radar] 验证码流程发生未预期异常: {exc}")
             yield event.plain_result("验证码处理异常，请稍后重试或重新执行 /vrc登录。")

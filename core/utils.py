@@ -5,7 +5,33 @@ def extract_world_id(location: str | None) -> str:
     if ':' in text:
         world_part = text.split(':', 1)[0]
         return world_part if world_part.startswith('wrld_') else ""
+    if '/' in text:
+        world_part = text.split('/', 1)[0]
+        return world_part if world_part.startswith('wrld_') else ""
     return text if text.startswith('wrld_') else ""
+
+
+def _split_world_and_instance(location: str) -> tuple[str, str]:
+    text = str(location or '').strip()
+    if not text:
+        return '', ''
+
+    if ':' in text:
+        world_part, instance_part = text.split(':', 1)
+        world_part = world_part.strip()
+        if world_part.startswith('wrld_'):
+            return world_part, instance_part.strip()
+
+    if '/' in text:
+        world_part, instance_part = text.split('/', 1)
+        world_part = world_part.strip()
+        if world_part.startswith('wrld_'):
+            return world_part, instance_part.strip()
+
+    world_id = extract_world_id(text)
+    if world_id:
+        return world_id, ''
+    return '', ''
 
 
 def get_location_group_key(location: str | None) -> str:
@@ -15,12 +41,26 @@ def get_location_group_key(location: str | None) -> str:
     lowered = text.lower()
     if lowered in {'offline', 'unknown', 'traveling', 'travelling', 'private'}:
         return ""
-    if ':' in text:
-        world_part = text.split(':', 1)[0]
-        if world_part.startswith('wrld_'):
-            return text
-    world_id = extract_world_id(text)
-    return world_id if world_id else ""
+
+    world_id, instance_raw = _split_world_and_instance(text)
+    if not world_id:
+        return ""
+    if not instance_raw:
+        return world_id
+
+    instance_id = instance_raw.split('~', 1)[0].strip()
+    if not instance_id:
+        return world_id
+
+    mode = _parse_instance_access_mode(text)
+    mode_suffix = {
+        'public': '~public',
+        'hidden': '~hidden',
+        'friends': '~friends',
+        'private': '~private',
+        'group': '~group',
+    }.get(mode, '')
+    return f"{world_id}:{instance_id}{mode_suffix}"
 
 
 def _parse_instance_access_mode(location: str | None) -> str:
@@ -32,8 +72,12 @@ def _parse_instance_access_mode(location: str | None) -> str:
         return 'unknown'
     text = str(location).strip().lower()
     if ':' not in text:
-        return 'unknown'
-    instance_part = text.split(':', 1)[1]
+        if '/' in text:
+            instance_part = text.split('/', 1)[1]
+        else:
+            return 'unknown'
+    else:
+        instance_part = text.split(':', 1)[1]
 
     if '~public' in instance_part:
         return 'public'
@@ -88,7 +132,7 @@ def format_location(location: str | None) -> str:
     if lowered == 'unknown':
         return '未知位置'
 
-    if ':' not in text:
+    if ':' not in text and '/' not in text:
         if text.startswith('wrld_'):
             return '某个世界'
         return text

@@ -16,7 +16,7 @@ class PluginConfig:
     watch_self: bool = False
     enable_status_tracking: bool = True
     enable_world_tracking: bool = True
-    vrchat_user_agent: str = "AstrBotVRCFriendRadar/0.1.0 contact@example.com"
+    vrchat_user_agent: str = "AstrBotVRCFriendRadar/0.1.0"
     login_session_timeout_seconds: int = 30
     event_dedupe_window_seconds: int = 300
     event_batch_size: int = 10
@@ -44,7 +44,7 @@ class PluginConfig:
         self.vrchat_user_agent = str(
             self._read(
                 "vrchat_user_agent",
-                "AstrBotVRCFriendRadar/0.1.0 contact@example.com",
+                "AstrBotVRCFriendRadar/0.1.0",
             )
         ).strip()
         self.login_session_timeout_seconds = max(30, min(600, self._read_int("login_session_timeout_seconds", 30)))
@@ -155,11 +155,19 @@ class PluginConfig:
         except Exception:
             return False
 
+    def has_notify_group_ids_key(self) -> bool:
+        return self._has_key("notify_group_ids")
+
+    def has_watch_friend_ids_key(self) -> bool:
+        return self._has_key("watch_friend_ids")
+
     def read_notify_group_ids_from_raw(self) -> list[str]:
-        return self._normalize_str_list(self._read_list("notify_group_ids", list(self.notify_group_ids)))
+        # 注意：这里缺省值必须是 []，不能回退到 runtime list；否则 WebUI 删除到空时会被旧值回填
+        return self._normalize_str_list(self._read_list("notify_group_ids", []))
 
     def read_watch_friend_ids_from_raw(self) -> list[str]:
-        return self._normalize_str_list(self._read_list("watch_friend_ids", list(self.watch_friend_ids)))
+        # 注意：这里缺省值必须是 []，不能回退到 runtime list；否则 WebUI 删除到空时会被旧值回填
+        return self._normalize_str_list(self._read_list("watch_friend_ids", []))
 
     def sync_runtime_lists(
         self,

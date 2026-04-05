@@ -42,8 +42,8 @@
   "vrchat_user_agent": {
     "type": "string",
     "description": "VRChat User-Agent",
-    "hint": "必须带上注册邮箱，不然登陆失败，例如 AstrBotVRCFriendRadar/0.1.0 123@qq.com",
-    "default": "AstrBotVRCFriendRadar/0.1.0 contact@example.com"
+    "hint": "默认推荐使用插件标识型 UA（非浏览器伪装），可按需在末尾追加联系方式（如 AstrBotVRCFriendRadar/0.1.0 contact@example.com）。",
+    "default": "AstrBotVRCFriendRadar/0.1.0"
   },
   "login_session_timeout_seconds": {
     "type": "int",

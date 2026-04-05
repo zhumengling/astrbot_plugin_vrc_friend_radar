@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
+
+from astrbot.api import logger
 
 from .models import FriendSnapshot
 
@@ -17,6 +21,17 @@ class VRChatTwoFactorRequiredError(VRChatClientError):
         self.method = method
 
 
+class VRChatAuthInvalidError(VRChatClientError):
+    def __init__(self, message: str, *, status: int | None = None, reason: str = ''):
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
+
+
+class VRChatNetworkError(VRChatClientError):
+    pass
+
+
 @dataclass(slots=True)
 class LoginResult:
     ok: bool
@@ -26,8 +41,10 @@ class LoginResult:
 
 
 class VRChatClient:
-    def __init__(self, user_agent: str):
+    def __init__(self, user_agent: str, request_timeout_seconds: int = 25, connect_timeout_seconds: int = 10):
         self.user_agent = user_agent
+        self.request_timeout_seconds = max(5, int(request_timeout_seconds or 25))
+        self.connect_timeout_seconds = max(3, min(self.request_timeout_seconds, int(connect_timeout_seconds or 10)))
         self._api_client = None
         self._configuration = None
         self._username = ""
@@ -39,12 +56,153 @@ class VRChatClient:
     async def login(self, username: str, password: str, two_factor_code: str | None = None) -> LoginResult:
         return await asyncio.to_thread(self._login_sync, username, password, two_factor_code)
 
+    def _request_timeout_tuple(self) -> tuple[int, int]:
+        return (self.connect_timeout_seconds, self.request_timeout_seconds)
+
     def _create_api_client(self, username: str, password: str, cookie: str | None = None):
         import vrchatapi
         configuration = vrchatapi.Configuration(username=username, password=password)
         api_client = vrchatapi.ApiClient(configuration, cookie=cookie)
         api_client.user_agent = self.user_agent
         return configuration, api_client
+
+    @staticmethod
+    def _build_exception_text(exc: Exception) -> str:
+        parts = [str(exc or '')]
+        reason = getattr(exc, 'reason', '')
+        body = getattr(exc, 'body', '')
+        if reason:
+            parts.append(str(reason))
+        if body:
+            parts.append(str(body))
+        return ' | '.join(p for p in parts if p).strip().lower()
+
+    @staticmethod
+    def _extract_status_code(exc: Exception) -> int | None:
+        for attr in ('status', 'status_code', 'code', 'http_status'):
+            value = getattr(exc, attr, None)
+            try:
+                number = int(value)
+                if 100 <= number <= 599:
+                    return number
+            except Exception:
+                continue
+
+        text = VRChatClient._build_exception_text(exc)
+        if not text:
+            return None
+        match = re.search(r'\b(401|403)\b', text)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+        return None
+
+    @classmethod
+    def _is_auth_invalid_exception(cls, exc: Exception) -> bool:
+        status = cls._extract_status_code(exc)
+        if status in (401, 403):
+            return True
+        text = cls._build_exception_text(exc)
+        if not text:
+            return False
+        markers = (
+            'unauthorized',
+            'forbidden',
+            'missing credentials',
+            'missing authentication credentials',
+            'authentication credentials were not provided',
+            'invalid credentials',
+            'invalid auth',
+            'auth token',
+            'jwt',
+            'login required',
+            'status 401',
+            'status 403',
+        )
+        return any(marker in text for marker in markers)
+
+    @classmethod
+    def _is_two_factor_challenge_exception(cls, exc: Exception) -> bool:
+        text = cls._build_exception_text(exc)
+        if not text:
+            return False
+        markers = (
+            'email 2 factor authentication',
+            '2 factor authentication',
+            'two factor authentication',
+            '2fa',
+        )
+        return any(marker in text for marker in markers)
+
+    @classmethod
+    def _is_invalid_credentials_exception(cls, exc: Exception) -> bool:
+        text = cls._build_exception_text(exc)
+        if not text:
+            return False
+        markers = (
+            'invalid username/email or password',
+            'invalid username or password',
+            'invalid email or password',
+            'invalid username/email',
+            'invalid credentials',
+            'bad credentials',
+        )
+        return any(marker in text for marker in markers)
+
+    @classmethod
+    def _is_network_exception(cls, exc: Exception) -> bool:
+        text = cls._build_exception_text(exc)
+        if not text:
+            return False
+        markers = (
+            'timed out',
+            'timeout',
+            'connection reset',
+            'connection aborted',
+            'connection refused',
+            'temporary failure in name resolution',
+            'name or service not known',
+            'network is unreachable',
+            'failed to establish a new connection',
+            'max retries exceeded',
+            'ssl',
+            'dns',
+        )
+        return any(marker in text for marker in markers)
+
+    def is_auth_invalid_exception(self, exc: Exception) -> bool:
+        return self._is_auth_invalid_exception(exc)
+
+    @classmethod
+    def _raise_as_client_error(
+        cls,
+        context: str,
+        exc: Exception,
+        *,
+        invalid_credentials_in_login_phase: bool = False,
+    ):
+        status = cls._extract_status_code(exc)
+        reason = str(getattr(exc, 'reason', '') or str(exc))
+        if cls._is_two_factor_challenge_exception(exc):
+            reason_lower = reason.lower()
+            method = 'email' if 'email 2 factor authentication' in reason_lower else 'totp_or_recovery'
+            raise VRChatTwoFactorRequiredError(method) from exc
+        if cls._is_invalid_credentials_exception(exc):
+            if invalid_credentials_in_login_phase:
+                raise VRChatClientError(f"{context}: 用户名或密码错误") from exc
+            # 运行期（非首次登录）出现 invalid credentials，更可能是会话/认证状态异常，而不是用户重新输错密码
+            raise VRChatAuthInvalidError(
+                f"{context}: 运行期认证状态异常(self/user unauthorized)，请重新登录",
+                status=status,
+                reason=reason,
+            ) from exc
+        if cls._is_auth_invalid_exception(exc):
+            raise VRChatAuthInvalidError(f"{context}: 认证失效，请重新登录", status=status, reason=reason) from exc
+        if cls._is_network_exception(exc):
+            raise VRChatNetworkError(f"{context}: 网络异常或请求超时，请稍后重试") from exc
+        raise VRChatClientError(f"{context}: {exc}") from exc
 
     @staticmethod
     def _to_text(value) -> str:
@@ -201,48 +359,105 @@ class VRChatClient:
         except ImportError as exc:
             raise VRChatClientError("缺少 vrchatapi 依赖，请先安装 requirements.txt") from exc
 
-        configuration, api_client = self._create_api_client(username, password)
-        auth_api = authentication_api.AuthenticationApi(api_client)
+        login_start = time.monotonic()
+        logger.info(
+            "[vrc_friend_radar] 开始执行 VRChat 登录请求 user=%s user_len=%s pwd_len=%s pwd_contains_ws=%s pwd_leading_ws=%s pwd_trailing_ws=%s UA=%s timeout=%s",
+            username,
+            len(username or ''),
+            len(password or ''),
+            any(ch.isspace() for ch in str(password or '')),
+            bool(str(password or '') and str(password or '')[0].isspace()),
+            bool(str(password or '') and str(password or '')[-1].isspace()),
+            self.user_agent,
+            self._request_timeout_tuple(),
+        )
 
-        try:
+        for attempt in (1, 2):
+            configuration, api_client = self._create_api_client(username, password)
+            auth_api = authentication_api.AuthenticationApi(api_client)
             try:
-                current_user = auth_api.get_current_user()
-            except UnauthorizedException as exc:
-                if exc.status != 200:
-                    api_client.close()
-                    raise VRChatClientError(f"登录失败: {exc}") from exc
-                reason = str(getattr(exc, "reason", ""))
-                reason_lower = reason.lower()
-                if "email 2 factor authentication" in reason_lower:
-                    if not two_factor_code:
+                try:
+                    logger.info(f"[vrc_friend_radar] 登录阶段 stage=initial_get_current_user start user={username} attempt={attempt}")
+                    current_user = auth_api.get_current_user(_request_timeout=self._request_timeout_tuple())
+                    logger.info(f"[vrc_friend_radar] 登录阶段 stage=initial_get_current_user ok user={username} attempt={attempt}")
+                except UnauthorizedException as exc:
+                    if exc.status != 200:
                         api_client.close()
-                        raise VRChatTwoFactorRequiredError("email") from exc
-                    auth_api.verify2_fa_email_code(TwoFactorEmailCode(two_factor_code))
-                elif "2 factor authentication" in reason_lower:
-                    if not two_factor_code:
+                        self._raise_as_client_error("登录失败", exc, invalid_credentials_in_login_phase=True)
+                    reason = str(getattr(exc, "reason", ""))
+                    reason_lower = reason.lower()
+                    full_text = self._build_exception_text(exc)
+                    if "email 2 factor authentication" in reason_lower or "email 2 factor authentication" in full_text:
+                        if not two_factor_code:
+                            api_client.close()
+                            raise VRChatTwoFactorRequiredError("email") from exc
+                        logger.info(f"[vrc_friend_radar] 登录阶段 stage=verify_2fa_email start user={username} attempt={attempt}")
+                        auth_api.verify2_fa_email_code(TwoFactorEmailCode(two_factor_code), _request_timeout=self._request_timeout_tuple())
+                        logger.info(f"[vrc_friend_radar] 登录阶段 stage=verify_2fa_email ok user={username} attempt={attempt}")
+                    elif (
+                        "2 factor authentication" in reason_lower
+                        or "two factor authentication" in full_text
+                        or "2 factor authentication" in full_text
+                        or "2fa" in full_text
+                    ):
+                        if not two_factor_code:
+                            api_client.close()
+                            raise VRChatTwoFactorRequiredError("totp_or_recovery") from exc
+                        try:
+                            logger.info(f"[vrc_friend_radar] 登录阶段 stage=verify_2fa_totp start user={username} attempt={attempt}")
+                            auth_api.verify2_fa(TwoFactorAuthCode(two_factor_code), _request_timeout=self._request_timeout_tuple())
+                            logger.info(f"[vrc_friend_radar] 登录阶段 stage=verify_2fa_totp ok user={username} attempt={attempt}")
+                        except Exception:
+                            logger.info(f"[vrc_friend_radar] 登录阶段 stage=verify_recovery_code start user={username} attempt={attempt}")
+                            auth_api.verify_recovery_code(TwoFactorAuthCode(two_factor_code), _request_timeout=self._request_timeout_tuple())
+                            logger.info(f"[vrc_friend_radar] 登录阶段 stage=verify_recovery_code ok user={username} attempt={attempt}")
+                    elif self._is_invalid_credentials_exception(exc):
                         api_client.close()
-                        raise VRChatTwoFactorRequiredError("totp_or_recovery") from exc
-                    try:
-                        auth_api.verify2_fa(TwoFactorAuthCode(two_factor_code))
-                    except Exception:
-                        auth_api.verify_recovery_code(TwoFactorAuthCode(two_factor_code))
-                else:
-                    api_client.close()
-                    raise VRChatClientError(f"无法识别的登录挑战: {reason}") from exc
-                current_user = auth_api.get_current_user()
+                        raise VRChatClientError("登录失败: 用户名或密码错误") from exc
+                    else:
+                        api_client.close()
+                        raise VRChatClientError(f"无法识别的登录挑战: {reason or exc}") from exc
+                    logger.info(f"[vrc_friend_radar] 登录阶段 stage=post_2fa_get_current_user start user={username} attempt={attempt}")
+                    current_user = auth_api.get_current_user(_request_timeout=self._request_timeout_tuple())
+                    logger.info(f"[vrc_friend_radar] 登录阶段 stage=post_2fa_get_current_user ok user={username} attempt={attempt}")
 
-            self._configuration = configuration
-            self._api_client = api_client
-            self._username = username
-            self._password = password
-            self._current_user_id = str(getattr(current_user, "id", "") or "")
-            self._current_user_display_name = str(getattr(current_user, "display_name", "") or "")
-            return LoginResult(ok=True, user_id=self._current_user_id, display_name=self._current_user_display_name, message="登录成功")
-        except VRChatClientError:
-            raise
-        except Exception as exc:
-            api_client.close()
-            raise VRChatClientError(f"VRChat 登录异常: {exc}") from exc
+                self._configuration = configuration
+                self._api_client = api_client
+                self._username = username
+                self._password = password
+                self._current_user_id = str(getattr(current_user, "id", "") or "")
+                self._current_user_display_name = str(getattr(current_user, "display_name", "") or "")
+                elapsed = time.monotonic() - login_start
+                logger.info(f"[vrc_friend_radar] VRChat 登录成功 user={username} elapsed={elapsed:.2f}s attempt={attempt}")
+                return LoginResult(ok=True, user_id=self._current_user_id, display_name=self._current_user_display_name, message="登录成功")
+            except VRChatTwoFactorRequiredError:
+                raise
+            except VRChatClientError as exc:
+                if attempt == 1 and (self._is_auth_invalid_exception(exc) or isinstance(exc, VRChatAuthInvalidError)):
+                    logger.warning('[vrc_friend_radar] 登录阶段认证异常，执行 clearCookiesTryLogin 风格重试一次。err=%s', exc)
+                    try:
+                        rest_client = getattr(api_client, 'rest_client', None)
+                        cookie_jar = getattr(rest_client, 'cookie_jar', None)
+                        if cookie_jar is not None:
+                            cookie_jar.clear()
+                    except Exception:
+                        pass
+                    api_client.close()
+                    self.close()
+                    continue
+                api_client.close()
+                raise
+            except Exception as exc:
+                api_client.close()
+                if attempt == 1 and self._is_auth_invalid_exception(exc):
+                    logger.warning('[vrc_friend_radar] 登录阶段出现疑似认证污染，执行 clearCookiesTryLogin 风格重试一次。err=%s', exc)
+                    self.close()
+                    continue
+                elapsed = time.monotonic() - login_start
+                logger.error(f"[vrc_friend_radar] VRChat 登录异常 user={username} elapsed={elapsed:.2f}s error={exc}")
+                self._raise_as_client_error("VRChat 登录异常", exc, invalid_credentials_in_login_phase=True)
+
+        raise VRChatClientError("登录失败: 会话初始化异常")
 
     async def restore_session(self, username: str, password: str, cookie: str) -> LoginResult:
         return await asyncio.to_thread(self._restore_session_sync, username, password, cookie)
@@ -258,23 +473,57 @@ class VRChatClient:
             raise VRChatClientError("缺少 vrchatapi 依赖，请先安装 requirements.txt") from exc
         configuration, api_client = self._create_api_client(username, password, cookie=cookie)
         auth_api = authentication_api.AuthenticationApi(api_client)
+        restore_start = time.monotonic()
+        logger.info(f"[vrc_friend_radar] 开始恢复 VRChat 会话 user={username} timeout={self._request_timeout_tuple()}")
         try:
-            current_user = auth_api.get_current_user()
+            current_user = auth_api.get_current_user(_request_timeout=self._request_timeout_tuple())
             self._configuration = configuration
             self._api_client = api_client
             self._username = username
             self._password = password
             self._current_user_id = str(getattr(current_user, "id", "") or "")
             self._current_user_display_name = str(getattr(current_user, "display_name", "") or "")
+            elapsed = time.monotonic() - restore_start
+            logger.info(f"[vrc_friend_radar] 恢复 VRChat 会话成功 user={username} elapsed={elapsed:.2f}s")
             return LoginResult(ok=True, user_id=self._current_user_id, display_name=self._current_user_display_name, message="恢复登录成功")
         except Exception as exc:
+            elapsed = time.monotonic() - restore_start
+            logger.error(f"[vrc_friend_radar] 恢复 VRChat 会话失败 user={username} elapsed={elapsed:.2f}s error={exc}")
             api_client.close()
-            raise VRChatClientError(f"恢复登录态失败: {exc}") from exc
+            self._raise_as_client_error("恢复登录态失败", exc)
+
+    def _extract_cookie_header(self) -> str:
+        if self._api_client is None:
+            return ''
+
+        # 1) 优先读取 ApiClient.cookie（restore_session 场景通常可直接命中）
+        cookie = str(getattr(self._api_client, 'cookie', '') or '').strip()
+        if cookie:
+            return cookie
+
+        # 2) 兼容 vrchatapi-python 登录流程：cookie 常保存在 rest_client.cookie_jar
+        try:
+            rest_client = getattr(self._api_client, 'rest_client', None)
+            cookie_jar = getattr(rest_client, 'cookie_jar', None)
+            if cookie_jar is not None:
+                pairs: list[str] = []
+                for item in cookie_jar:
+                    name = str(getattr(item, 'name', '') or '').strip()
+                    if not name:
+                        continue
+                    value = str(getattr(item, 'value', '') or '')
+                    pairs.append(f"{name}={value}")
+                if pairs:
+                    return '; '.join(pairs)
+        except Exception:
+            pass
+
+        return ''
 
     def export_session(self) -> dict | None:
         if self._api_client is None or not self._username or not self._password:
             return None
-        cookie = getattr(self._api_client, 'cookie', '') or ''
+        cookie = self._extract_cookie_header()
         if not cookie:
             return None
         return {'username': self._username, 'password': self._password, 'cookie': cookie}
@@ -306,7 +555,7 @@ class VRChatClient:
                     batch = api.get_friends(offset=offset, n=n, offline=offline_flag)
                 except Exception as exc:
                     phase = 'offline' if offline_flag else 'online'
-                    raise VRChatClientError(f"获取好友列表失败({phase}, offset={offset}): {exc}") from exc
+                    self._raise_as_client_error(f"获取好友列表失败({phase}, offset={offset})", exc)
                 if not batch:
                     break
                 if offline_flag:
@@ -384,7 +633,7 @@ class VRChatClient:
         try:
             from vrchatapi.api import authentication_api
             api = authentication_api.AuthenticationApi(self._api_client)
-            current_user = api.get_current_user()
+            current_user = api.get_current_user(_request_timeout=self._request_timeout_tuple())
             self._current_user_id = str(getattr(current_user, 'id', '') or '')
             self._current_user_display_name = str(getattr(current_user, 'display_name', '') or '')
             return bool(self._current_user_id)
@@ -393,6 +642,50 @@ class VRChatClient:
 
     async def fetch_self_snapshot(self) -> FriendSnapshot | None:
         return await asyncio.to_thread(self._fetch_self_snapshot_sync)
+
+    async def verify_session_ready(self, require_friends_api: bool = True) -> bool:
+        return await asyncio.to_thread(self._verify_session_ready_sync, require_friends_api)
+
+    def _verify_session_ready_sync(self, require_friends_api: bool = True) -> bool:
+        if self._api_client is None:
+            raise VRChatClientError("尚未登录，无法校验会话")
+        try:
+            from vrchatapi.api import authentication_api
+            from vrchatapi.api import friends_api
+        except ImportError as exc:
+            raise VRChatClientError("缺少 vrchatapi 依赖") from exc
+
+        try:
+            auth_api = authentication_api.AuthenticationApi(self._api_client)
+            current_user = auth_api.get_current_user(_request_timeout=self._request_timeout_tuple())
+            self._current_user_id = str(getattr(current_user, 'id', '') or '')
+            self._current_user_display_name = str(getattr(current_user, 'display_name', '') or '')
+            if require_friends_api:
+                friends_api.FriendsApi(self._api_client).get_friends(offset=0, n=1, offline=False)
+            return True
+        except Exception as exc:
+            self._raise_as_client_error("登录后会话校验失败", exc)
+
+    async def probe_session_health(self) -> bool:
+        return await asyncio.to_thread(self._probe_session_health_sync)
+
+    def _probe_session_health_sync(self) -> bool:
+        if self._api_client is None:
+            return False
+        try:
+            from vrchatapi.api import authentication_api
+        except ImportError as exc:
+            raise VRChatClientError("缺少 vrchatapi 依赖") from exc
+        try:
+            api = authentication_api.AuthenticationApi(self._api_client)
+            current_user = api.get_current_user(_request_timeout=self._request_timeout_tuple())
+            self._current_user_id = str(getattr(current_user, 'id', '') or '')
+            self._current_user_display_name = str(getattr(current_user, 'display_name', '') or '')
+            return True
+        except Exception as exc:
+            if self._is_auth_invalid_exception(exc):
+                self._raise_as_client_error("会话健康检查失败", exc)
+            raise VRChatClientError(f"会话健康检查异常: {exc}") from exc
 
     def _fetch_self_snapshot_sync(self) -> FriendSnapshot | None:
         if self._api_client is None:
@@ -403,12 +696,14 @@ class VRChatClient:
             return None
         try:
             api = authentication_api.AuthenticationApi(self._api_client)
-            current_user = api.get_current_user()
+            current_user = api.get_current_user(_request_timeout=self._request_timeout_tuple())
             self._current_user_id = str(getattr(current_user, 'id', '') or '')
             self._current_user_display_name = str(getattr(current_user, 'display_name', '') or '')
             now = datetime.now().isoformat(timespec='seconds')
             return self._build_snapshot_from_user(current_user, now)
-        except Exception:
+        except Exception as exc:
+            if self._is_auth_invalid_exception(exc):
+                self._raise_as_client_error("获取当前用户信息失败", exc)
             return None
 
     def get_current_user_id(self) -> str:
@@ -446,7 +741,9 @@ class VRChatClient:
                 'author_name': str(getattr(world, 'author_name', '') or ''),
                 'capacity': int(getattr(world, 'capacity', 0) or 0),
             }
-        except Exception:
+        except Exception as exc:
+            if self._is_auth_invalid_exception(exc):
+                self._raise_as_client_error("获取世界信息失败", exc)
             return None
 
     async def search_worlds(self, keyword: str, limit: int = 5, offset: int = 0) -> list[dict]:
@@ -472,7 +769,9 @@ class VRChatClient:
                 }
                 for item in worlds
             ]
-        except Exception:
+        except Exception as exc:
+            if self._is_auth_invalid_exception(exc):
+                self._raise_as_client_error("搜索世界失败", exc)
             return []
 
 
@@ -485,7 +784,7 @@ class VRChatClient:
         if self._api_client is None:
             raise VRChatClientError("尚未登录，无法使用已登录会话下载图片")
         import urllib.request
-        cookie = getattr(self._api_client, 'cookie', '') or ''
+        cookie = self._extract_cookie_header()
         headers = {
             'User-Agent': self.user_agent,
             'Referer': 'https://vrchat.com/',
@@ -507,6 +806,9 @@ class VRChatClient:
 
     def is_logged_in(self) -> bool:
         return self._api_client is not None
+
+    def get_saved_credentials(self) -> tuple[str, str]:
+        return self._username, self._password
 
     def close(self) -> None:
         if self._api_client is not None:
