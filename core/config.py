@@ -2,6 +2,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    from astrbot.api import logger as _logger
+except Exception:
+    import logging as _logging
+    _logger = _logging.getLogger('vrc_friend_radar')
+
 
 DEFAULT_DAILY_TASK_TIME = "21:00"
 
@@ -17,6 +23,7 @@ class PluginConfig:
     enable_status_tracking: bool = True
     enable_world_tracking: bool = True
     vrchat_user_agent: str = "AstrBotVRCFriendRadar/0.1.0"
+    vrchat_contact_info: str = ""
     login_session_timeout_seconds: int = 30
     event_dedupe_window_seconds: int = 300
     event_batch_size: int = 10
@@ -41,12 +48,24 @@ class PluginConfig:
         self.watch_self = self._read_bool("watch_self", False)
         self.enable_status_tracking = self._read_bool("enable_status_tracking", True)
         self.enable_world_tracking = self._read_bool("enable_world_tracking", True)
-        self.vrchat_user_agent = str(
+        _base_ua = str(
             self._read(
                 "vrchat_user_agent",
                 "AstrBotVRCFriendRadar/0.1.0",
             )
+        ).strip() or "AstrBotVRCFriendRadar/0.1.0"
+        self.vrchat_contact_info = str(
+            self._read("vrchat_contact_info", "")
         ).strip()
+        if self.vrchat_contact_info:
+            self.vrchat_user_agent = f"{_base_ua} {self.vrchat_contact_info}"
+        else:
+            self.vrchat_user_agent = _base_ua
+            _logger.warning(
+                "[vrc_friend_radar] vrchat_contact_info 未配置！VRChat 官方要求 User-Agent 中包含联系方式（邮箱），"
+                "缺少联系方式会显著增加 Cloudflare 风控概率。"
+                "请在插件配置中填写 vrchat_contact_info （如 your-email@example.com）。"
+            )
         self.login_session_timeout_seconds = max(30, min(600, self._read_int("login_session_timeout_seconds", 30)))
         self.event_dedupe_window_seconds = max(30, self._read_int("event_dedupe_window_seconds", 300))
         self.event_batch_size = max(1, min(50, self._read_int("event_batch_size", 10)))

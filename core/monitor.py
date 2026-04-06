@@ -66,7 +66,7 @@ class MonitorService:
         self._is_waiting_2fa_for_auto_recover: bool = False
         self._auto_recover_pending_method: str = ''
         self._session_persist_interval_seconds = 300
-        self._health_check_interval_seconds = 600
+        self._health_check_interval_seconds = 1800
         self._last_session_persist_at: float = 0.0
         self._last_health_check_at: float = 0.0
         self._last_persisted_cookie: str = ''
@@ -83,6 +83,7 @@ class MonitorService:
         self._last_self_snapshot_failure_at: float = 0.0
         self._last_self_snapshot_success_at: float = 0.0
         self._self_snapshot_failure_streak: int = 0
+        self._post_login_cooldown_until: float = 0.0
 
     def _recreate_client(self, preserve_credentials: bool = True) -> None:
         username = password = ""
@@ -119,7 +120,7 @@ class MonitorService:
             result = await self.client.restore_session(username, password, cookie)
             self._last_login_result = result
             self.persist_session(force=True)
-            await self._log_friends_api_readiness(stage='startup_restore_post_auth')
+            self._reset_auto_recover_2fa_waiting()
             self._mark_auto_recover_result('启动恢复成功', '插件启动时restore_session成功')
             logger.info('[vrc_friend_radar] 启动恢复: restore_session 成功')
             return True
@@ -396,7 +397,8 @@ class MonitorService:
                     result = await self.client.restore_session(stored_username, stored_password, stored_cookie)
                     self._last_login_result = result
                     self.persist_session(force=True)
-                    await self._log_friends_api_readiness(stage='auto_recover_restore_post_auth')
+                    self._post_login_cooldown_until = time.time() + 60
+                    self._last_health_check_at = time.time()
                     self._reset_auto_recover_2fa_waiting()
                     self._mark_auto_recover_result('成功(restore_session)', '已通过持久化session恢复')
                     logger.info('[vrc_friend_radar] 自动恢复步骤 stage=restore_session success')
@@ -433,7 +435,8 @@ class MonitorService:
                 result = await self.client.login(username=username, password=password)
                 self._last_login_result = result
                 self.persist_session(force=True)
-                await self._log_friends_api_readiness(stage='auto_recover_relogin_post_auth')
+                self._post_login_cooldown_until = time.time() + 60
+                self._last_health_check_at = time.time()
                 self._reset_auto_recover_2fa_waiting()
                 self._mark_auto_recover_result('成功(relogin)', '已执行清旧会话后账号密码重登')
                 logger.info('[vrc_friend_radar] 自动恢复步骤 stage=relogin success')
@@ -525,50 +528,55 @@ class MonitorService:
                 await self._try_periodic_session_persist()
                 await self._try_periodic_health_check()
             if self.cfg.allow_auto_push and self.client.is_logged_in():
-                try:
-                    if self._poll_lock.locked():
-                        logger.info('[vrc_friend_radar] 本轮自动检测跳过：检测/同步任务仍在执行中（互斥锁占用）')
-                    else:
-                        detect_timeout = max(10, min(self.cfg.poll_interval_seconds - 5, 120))
-                        events = await asyncio.wait_for(self.detect_changes(), timeout=detect_timeout)
-                        if events and self._event_callback:
-                            try:
-                                await self._event_callback(events)
-                            except Exception as exc:
-                                if isinstance(exc, VRChatAuthInvalidError) or self.client.is_auth_invalid_exception(exc):
-                                    logger.warning(f"[vrc_friend_radar] 事件回调阶段遇到认证失效: {exc}")
-                                    self._record_disconnect_reason('auth invalid', str(exc), source='event_callback')
-                                    recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='event_callback')
-                                    if recovered:
-                                        logger.info('[vrc_friend_radar] 事件回调认证失效后自动恢复成功，将在下一轮继续监控')
-                                else:
-                                    logger.error(f"[vrc_friend_radar] 事件回调执行失败: {exc}", exc_info=True)
-                except asyncio.TimeoutError:
-                    logger.error("[vrc_friend_radar] 轮询检测超时，已跳过本轮")
-                except VRChatAuthInvalidError as exc:
-                    logger.warning(f"[vrc_friend_radar] 轮询检测遇到认证失效: {exc}")
-                    self._record_disconnect_reason('auth invalid', str(exc), source='detect_changes')
-                    recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='detect_changes_auth_invalid')
-                    if recovered:
-                        logger.info('[vrc_friend_radar] 认证失效后自动恢复成功，将在下一轮继续监控')
-                except VRChatClientError as exc:
-                    if self.client.is_auth_invalid_exception(exc):
-                        logger.warning(f"[vrc_friend_radar] 轮询检测遇到疑似认证失效(VRChatClientError): {exc}")
-                        self._record_disconnect_reason('auth invalid', str(exc), source='detect_changes_client_error')
-                        recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='detect_changes_client_error')
+                _loop_now = time.time()
+                if _loop_now < self._post_login_cooldown_until:
+                    _remaining = int(self._post_login_cooldown_until - _loop_now)
+                    logger.info('[vrc_friend_radar] 登录后冷却期内，跳过本轮自动检测，剩余 %ss', _remaining)
+                else:
+                    try:
+                        if self._poll_lock.locked():
+                            logger.info('[vrc_friend_radar] 本轮自动检测跳过：检测/同步任务仍在执行中（互斥锁占用）')
+                        else:
+                            detect_timeout = max(10, min(self.cfg.poll_interval_seconds - 5, 120))
+                            events = await asyncio.wait_for(self.detect_changes(), timeout=detect_timeout)
+                            if events and self._event_callback:
+                                try:
+                                    await self._event_callback(events)
+                                except Exception as exc:
+                                    if isinstance(exc, VRChatAuthInvalidError) or self.client.is_auth_invalid_exception(exc):
+                                        logger.warning(f"[vrc_friend_radar] 事件回调阶段遇到认证失效: {exc}")
+                                        self._record_disconnect_reason('auth invalid', str(exc), source='event_callback')
+                                        recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='event_callback')
+                                        if recovered:
+                                            logger.info('[vrc_friend_radar] 事件回调认证失效后自动恢复成功，将在下一轮继续监控')
+                                    else:
+                                        logger.error(f"[vrc_friend_radar] 事件回调执行失败: {exc}", exc_info=True)
+                    except asyncio.TimeoutError:
+                        logger.error("[vrc_friend_radar] 轮询检测超时，已跳过本轮")
+                    except VRChatAuthInvalidError as exc:
+                        logger.warning(f"[vrc_friend_radar] 轮询检测遇到认证失效: {exc}")
+                        self._record_disconnect_reason('auth invalid', str(exc), source='detect_changes')
+                        recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='detect_changes_auth_invalid')
                         if recovered:
-                            logger.info('[vrc_friend_radar] 疑似认证失效后自动恢复成功，将在下一轮继续监控')
-                    else:
-                        logger.error(f"[vrc_friend_radar] 轮询检测失败: {exc}", exc_info=True)
-                except Exception as exc:
-                    if self.client.is_auth_invalid_exception(exc):
-                        logger.warning(f"[vrc_friend_radar] 轮询检测遇到疑似认证失效(unknown): {exc}")
-                        self._record_disconnect_reason('auth invalid', str(exc), source='detect_changes_unknown')
-                        recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='detect_changes_unknown_error')
-                        if recovered:
-                            logger.info('[vrc_friend_radar] 疑似认证失效后自动恢复成功，将在下一轮继续监控')
-                    else:
-                        logger.error(f"[vrc_friend_radar] 轮询检测失败: {exc}", exc_info=True)
+                            logger.info('[vrc_friend_radar] 认证失效后自动恢复成功，将在下一轮继续监控')
+                    except VRChatClientError as exc:
+                        if self.client.is_auth_invalid_exception(exc):
+                            logger.warning(f"[vrc_friend_radar] 轮询检测遇到疑似认证失效(VRChatClientError): {exc}")
+                            self._record_disconnect_reason('auth invalid', str(exc), source='detect_changes_client_error')
+                            recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='detect_changes_client_error')
+                            if recovered:
+                                logger.info('[vrc_friend_radar] 疑似认证失效后自动恢复成功，将在下一轮继续监控')
+                        else:
+                            logger.error(f"[vrc_friend_radar] 轮询检测失败: {exc}", exc_info=True)
+                    except Exception as exc:
+                        if self.client.is_auth_invalid_exception(exc):
+                            logger.warning(f"[vrc_friend_radar] 轮询检测遇到疑似认证失效(unknown): {exc}")
+                            self._record_disconnect_reason('auth invalid', str(exc), source='detect_changes_unknown')
+                            recovered = await self.auto_recover_login(str(exc), trigger_exc=exc, source='detect_changes_unknown_error')
+                            if recovered:
+                                logger.info('[vrc_friend_radar] 疑似认证失效后自动恢复成功，将在下一轮继续监控')
+                        else:
+                            logger.error(f"[vrc_friend_radar] 轮询检测失败: {exc}", exc_info=True)
             if self._loop_tick_callback:
                 try:
                     await self._loop_tick_callback(datetime.now())
@@ -584,11 +592,14 @@ class MonitorService:
         result = await self.client.login(username=username, password=password, two_factor_code=two_factor_code)
         self._last_login_result = result
         self.persist_session(force=True)
-        await self._log_friends_api_readiness(stage='manual_login_post_auth')
 
-        await self._safe_fetch_self_snapshot(stage='manual_login_post_auth', trigger_recover_if_auth_invalid=False)
+        if self.cfg.watch_self:
+            await self._safe_fetch_self_snapshot(stage='manual_login_post_auth', trigger_recover_if_auth_invalid=False)
 
+        self._post_login_cooldown_until = time.time() + 60
+        self._last_health_check_at = time.time()
         self._reset_auto_recover_2fa_waiting()
+        logger.info('[vrc_friend_radar] 登录成功，已设置 60 秒冷却期及健康检查计时重置')
         return result
 
     async def sync_friends(self) -> list[FriendSnapshot]:
