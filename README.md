@@ -83,7 +83,7 @@ pyotp>=2.9.0
 | `watch_self` | bool | false | 是否监控登录账号自己；会把自己加入“有效监控集合”（不写回列表）。 |
 | `enable_status_tracking` | bool | true | 是否追踪状态相关事件（上线/下线/状态/签名）。 |
 | `enable_world_tracking` | bool | true | 是否追踪 `location_changed`。 |
-| `vrchat_user_agent` | string | `AstrBotVRCFriendRadar/0.1.0` | VRChat User-Agent；默认推荐使用插件标识型 UA（非浏览器伪装）。若需联系方式，可在末尾追加邮箱后缀。 |
+| `vrchat_user_agent` | string | `AstrBotVRCFriendRadar/0.1.0` | VRChat User-Agent；默认推荐使用插件标识型 UA（非浏览器伪装）。 |
 | `login_session_timeout_seconds` | int | 30 | 登录交互超时；代码约束范围 `30~600`。 |
 | `event_dedupe_window_seconds` | int | 300 | 事件去重窗口；代码最小 `30`。 |
 | `event_batch_size` | int | 10 | 单次推送最大事件条数；代码约束 `1~50`。 |
@@ -202,30 +202,9 @@ pyotp>=2.9.0
 ---
 
 
-## 本次稳定性增强（2026-04）
-
-- 增强 `vrc状态` 可观测性：明确区分 **Web/API登录态** 与 **当前账号客户端在线态**（避免“网页在线=客户端在线”误判）。
-- 修复自动恢复2FA等待超时后的状态僵死：超时会自动退出等待并恢复后续自动恢复能力。
-- 监控循环停止时增加会话强制落盘，降低重启前 cookie 丢失风险。
-- 图片下载链路改为复用统一 cookie 提取逻辑，提升 world 图下载成功率。
-- 插件生命周期清理补充：停止时释放搜索会话与翻译锁缓存，降低长时间运行内存残留。
-
 ## 常见问题 / 注意事项
 
 1. **轮询频率建议**  
    不建议低于 60 秒；默认 180 秒通常更稳妥。
 
 ---
-
-### 登录/恢复行为说明（向 VRCX 靠拢）
-
-- **安全修复（本地密码落盘）**：`session.json` 现仅保存 `username` 与 `cookie`，不再写入/使用明文 `password`。检测到旧版 `password` 字段时会自动清理并覆盖落盘。
-- 自动恢复能力调整：
-  - 启动时：仍会优先尝试 `username + cookie` 的 `restore_session`；
-  - 若 cookie 失效：由于不再持久化本地密码，**不会**在重启后自动用密码重登，需管理员私聊执行 `/vrc登录`（及必要的 `/vrc验证码`）；
-  - 运行中：若当前进程内仍有登录时输入的密码，仍可继续执行自动重登/2FA 流程。
-- 登录成功判定以 Auth 成功为准：`get_current_user`（含2FA后）成功即视为登录成功，不再将 friends API 作为登录硬门槛。
-- 登录阶段若出现疑似认证污染（401/403 等），会执行一次“清 cookie + 重建 client”的单次重试（类似 VRCX clearCookiesTryLogin 思路）。
-- 启动 restore 或自动恢复 restore 失败后，会先清理旧会话状态并重建 client，再进行账号密码重登，避免脏 cookie/脏 client 反复污染。
-- 错误提示细分：用户名/密码错误、2FA、认证失效、网络异常分开提示。
-
