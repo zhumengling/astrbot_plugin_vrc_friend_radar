@@ -361,41 +361,21 @@ class VRCFriendRadarPlugin(Star):
         return world_name
 
     async def _format_events_for_push(self, events):
+        def _clean_text(value: str | None, fallback: str = '空') -> str:
+            text = str(value or '').strip()
+            return text or fallback
+
+        def _build_multiline_message(title: str, detail_lines: list[str]) -> str:
+            lines = [title]
+            lines.extend([line for line in detail_lines if line])
+            return '\n'.join(lines)
+
         messages = []
         snapshot_map = self.db.get_friend_snapshot_map()
-        for item in events[: self.cfg.event_batch_size]:
-            if item.event_type == 'location_changed':
-                old_name = await self._get_world_name(item.old_value)
-                new_name = await self._get_world_name(item.new_value)
-                current_snapshot = snapshot_map.get(item.friend_user_id)
-                current_status = current_snapshot.status if current_snapshot else None
-                messages.append(
-                    self.monitor.notifier.build_location_change_message(
-                        item.display_name,
-                        old_name,
-                        new_name,
-                        item.old_value,
-                        item.new_value,
-                        status=current_status,
-                    )
-                )
-                continue
-            if item.event_type == 'friend_online':
-                current = snapshot_map.get(item.friend_user_id)
-                joinability = infer_joinability(
-                    current.location if current else None,
-                    status=current.status if current else item.new_value,
-                )
-                world_text = (
-                    await self._format_world_display(current.location)
-                    if current
-                    else '未知位置'
-                )
-                shown_name = self._sanitize_display_name_for_output(item.display_name)
-                messages.append(
-                    f"🟢 {shown_name} 上线啦 | 状态：{item.new_value or 'unknown'} | 位置：{world_text} | {joinability}"
-                )
-                continue
+        limited_events = list(events[: self.cfg.event_batch_size])
+
+        friend_events: dict[str, list] = {}
+        for item in limited_events:
             if item.event_type == 'co_room':
                 world_text = await self._format_world_display(item.friend_user_id)
                 names = [name for name in (item.display_name or '').split('、') if name]
@@ -409,7 +389,102 @@ class VRCFriendRadarPlugin(Star):
                     )
                 )
                 continue
-            messages.append(self.monitor.notifier.build_message(item))
+            friend_events.setdefault(item.friend_user_id, []).append(item)
+
+        priority = {
+            'friend_offline': 0,
+            'friend_online': 1,
+            'status_changed': 2,
+            'location_changed': 3,
+            'status_message_changed': 4,
+        }
+
+        for friend_id, items in friend_events.items():
+            items = sorted(items, key=lambda x: priority.get(x.event_type, 99))
+            shown_name = self._sanitize_display_name_for_output(items[0].display_name)
+            current = snapshot_map.get(friend_id)
+            event_types = {item.event_type for item in items}
+
+            if 'friend_offline' in event_types:
+                messages.append(f"⚫ {shown_name} 下线了")
+                continue
+
+            if 'friend_online' in event_types:
+                online_event = next(item for item in items if item.event_type == 'friend_online')
+                status_text = _clean_text(online_event.new_value, 'unknown')
+                world_text = (
+                    await self._format_world_display(current.location)
+                    if current and current.location
+                    else '未知位置'
+                )
+                joinability = infer_joinability(
+                    current.location if current else None,
+                    status=current.status if current else online_event.new_value,
+                )
+
+                detail_lines = [
+                    f"状态：{status_text}",
+                    f"位置：{world_text}（{joinability}）",
+                ]
+
+                status_change_event = next((item for item in items if item.event_type == 'status_changed'), None)
+                if status_change_event:
+                    detail_lines.append(
+                        f"状态变化：{_clean_text(status_change_event.old_value, 'unknown')} → {_clean_text(status_change_event.new_value, 'unknown')}"
+                    )
+
+                location_event = next((item for item in items if item.event_type == 'location_changed'), None)
+                if location_event:
+                    old_name = await self._get_world_name(location_event.old_value)
+                    new_name = await self._get_world_name(location_event.new_value)
+                    old_joinability = infer_joinability(location_event.old_value)
+                    new_joinability = infer_joinability(
+                        location_event.new_value,
+                        status=current.status if current else online_event.new_value,
+                    )
+                    if not (str(location_event.old_value or '').strip().lower() == 'offline'):
+                        detail_lines.append(
+                            f"切换地图：{old_name}（{old_joinability}） → {new_name}（{new_joinability}）"
+                        )
+
+                sign_event = next((item for item in items if item.event_type == 'status_message_changed'), None)
+                if sign_event:
+                    detail_lines.append(
+                        f"签名：{_clean_text(sign_event.old_value)} → {_clean_text(sign_event.new_value)}"
+                    )
+
+                messages.append(_build_multiline_message(f"🟢 {shown_name} 上线了", detail_lines))
+                continue
+
+            detail_lines = []
+            status_change_event = next((item for item in items if item.event_type == 'status_changed'), None)
+            if status_change_event:
+                detail_lines.append(
+                    f"状态变化：{_clean_text(status_change_event.old_value, 'unknown')} → {_clean_text(status_change_event.new_value, 'unknown')}"
+                )
+
+            location_event = next((item for item in items if item.event_type == 'location_changed'), None)
+            if location_event:
+                old_name = await self._get_world_name(location_event.old_value)
+                new_name = await self._get_world_name(location_event.new_value)
+                current_status = current.status if current else None
+                old_joinability = infer_joinability(location_event.old_value)
+                new_joinability = infer_joinability(location_event.new_value, status=current_status)
+                detail_lines.append(
+                    f"切换地图：{old_name}（{old_joinability}） → {new_name}（{new_joinability}）"
+                )
+
+            sign_event = next((item for item in items if item.event_type == 'status_message_changed'), None)
+            if sign_event:
+                detail_lines.append(
+                    f"签名：{_clean_text(sign_event.old_value)} → {_clean_text(sign_event.new_value)}"
+                )
+
+            if detail_lines:
+                messages.append(_build_multiline_message(f"🔄 {shown_name}", detail_lines))
+            else:
+                for item in items:
+                    messages.append(self.monitor.notifier.build_message(item))
         return messages
 
     async def _push_chain_to_notify_groups(self, components: list) -> int:
@@ -652,7 +727,7 @@ class VRCFriendRadarPlugin(Star):
                 snapshot = snapshot_map.get(friend_id)
                 display = self._sanitize_display_name_for_output(snapshot.display_name if snapshot else '')
                 shown_name = display or '未知好友'
-                lines.append(f"{idx}. {shown_name} - 事件 {cnt}")
+                lines.append(f"{idx}. {shown_name}")
         else:
             lines.append("今日活跃好友 Top：暂无可用事件数据。")
 
