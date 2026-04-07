@@ -74,9 +74,9 @@ class VRCFriendRadarPlugin(Star):
         self.settings_repo.initialize()
         merged_notify_groups, merged_watch_friends = self._reconcile_dynamic_lists_on_startup()
         self._daily_task_last_sent_date["daily_report"] = self.settings_repo.get_daily_report_last_sent_date()
-        await self.monitor.start()
+        asyncio.create_task(self.monitor.start())
         logger.info(
-            "[vrc_friend_radar] 插件初始化完成，已同步列表: notify_groups=%s, watch_friends=%s",
+            "[vrc_friend_radar] 插件后台初始化开始，已同步列表: notify_groups=%s, watch_friends=%s",
             len(merged_notify_groups),
             len(merged_watch_friends),
         )
