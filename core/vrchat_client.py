@@ -553,7 +553,7 @@ class VRChatClient:
             n = 100
             while True:
                 try:
-                    batch = api.get_friends(offset=offset, n=n, offline=offline_flag)
+                    batch = api.get_friends(offset=offset, n=n, offline=offline_flag, _request_timeout=self._request_timeout_tuple())
                 except Exception as exc:
                     phase = 'offline' if offline_flag else 'online'
                     self._raise_as_client_error(f"获取好友列表失败({phase}, offset={offset})", exc)
@@ -662,7 +662,7 @@ class VRChatClient:
             self._current_user_id = str(getattr(current_user, 'id', '') or '')
             self._current_user_display_name = str(getattr(current_user, 'display_name', '') or '')
             if require_friends_api:
-                friends_api.FriendsApi(self._api_client).get_friends(offset=0, n=1, offline=False)
+                friends_api.FriendsApi(self._api_client).get_friends(offset=0, n=1, offline=False, _request_timeout=self._request_timeout_tuple())
             return True
         except Exception as exc:
             self._raise_as_client_error("登录后会话校验失败", exc)
@@ -732,7 +732,7 @@ class VRChatClient:
             return None
         try:
             api = worlds_api.WorldsApi(self._api_client)
-            world = api.get_world(world_id)
+            world = api.get_world(world_id, _request_timeout=self._request_timeout_tuple())
             return {
                 'id': world_id,
                 'name': str(getattr(world, 'name', '') or world_id),
@@ -759,7 +759,7 @@ class VRChatClient:
             return []
         try:
             api = worlds_api.WorldsApi(self._api_client)
-            worlds = api.search_worlds(search=keyword, n=limit, offset=offset)
+            worlds = api.search_worlds(search=keyword, n=limit, offset=offset, _request_timeout=self._request_timeout_tuple())
             return [
                 {
                     'id': str(getattr(item, 'id', '') or ''),

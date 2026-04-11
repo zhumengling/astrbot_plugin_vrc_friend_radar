@@ -318,6 +318,52 @@ class VRCFriendRadarPlugin(Star):
             messages.append("登录后自动回传在线好友失败，请稍后手动执行 /vrc在线好友")
         return messages
 
+    def _cleanup_temp_world_logo_files(
+        self,
+        temp_dir: Path,
+        *,
+        max_keep: int = 120,
+        expire_seconds: int = 7 * 24 * 3600,
+    ) -> None:
+        try:
+            files = [
+                item
+                for item in temp_dir.glob('world_logo_*')
+                if item.is_file()
+            ]
+        except Exception:
+            return
+
+        if not files:
+            return
+
+        now_ts = time.time()
+        for item in files:
+            try:
+                if now_ts - item.stat().st_mtime > max(3600, int(expire_seconds)):
+                    item.unlink(missing_ok=True)
+            except Exception:
+                continue
+
+        try:
+            remaining = [
+                item
+                for item in temp_dir.glob('world_logo_*')
+                if item.is_file()
+            ]
+        except Exception:
+            return
+
+        if len(remaining) <= max(10, int(max_keep)):
+            return
+
+        remaining.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for item in remaining[max(10, int(max_keep)):]:
+            try:
+                item.unlink(missing_ok=True)
+            except Exception:
+                continue
+
     async def _download_image_to_temp(self, url: str) -> str | None:
         if not url:
             return None
@@ -329,9 +375,12 @@ class VRCFriendRadarPlugin(Star):
             suffix = '.webp'
         temp_dir = Path(tempfile.gettempdir()) / 'vrc_friend_radar'
         temp_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_temp_world_logo_files(temp_dir)
         file_path = temp_dir / f"world_logo_{uuid.uuid4().hex}{suffix}"
         try:
-            return await self.monitor.client.download_image_authenticated(url, str(file_path))
+            result = await self.monitor.client.download_image_authenticated(url, str(file_path))
+            self._cleanup_temp_world_logo_files(temp_dir)
+            return result
         except Exception as exc:
             logger.error(f"[vrc_friend_radar] 下载地图Logo失败: {exc}")
             return None
@@ -619,7 +668,18 @@ class VRCFriendRadarPlugin(Star):
         now = datetime.now()
         start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(timespec='seconds')
         end = now.isoformat(timespec='seconds')
-        events = self.db.list_events_between(start, end, friend_ids=stat_friend_ids, limit=20000)
+        all_events = self.db.list_events_between(start, end, friend_ids=None, limit=20000)
+        events: list = []
+        stat_set = set(stat_friend_ids)
+        for item in all_events:
+            if item.event_type == 'co_room':
+                member_ids = [fid for fid in (item.new_value or '').split('|') if fid]
+                if any(fid in stat_set for fid in member_ids):
+                    events.append(item)
+                continue
+            if item.friend_user_id in stat_set:
+                events.append(item)
+
         snapshots = self.db.list_friend_snapshots_by_ids(stat_friend_ids)
 
         stats_map: dict[str, dict] = {}
@@ -643,7 +703,6 @@ class VRCFriendRadarPlugin(Star):
             if location and not item['sample_location']:
                 item['sample_location'] = location
 
-        stat_set = set(stat_friend_ids)
         for event in events:
             if event.event_type == 'location_changed':
                 location = event.new_value
