@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime, timedelta
 
 from .config import PluginConfig
 from .models import FriendSnapshot, RadarEvent
@@ -85,6 +86,21 @@ class RadarDB:
     @staticmethod
     def _clean_ids(ids: list[str] | None) -> list[str]:
         return [str(item).strip() for item in (ids or []) if str(item).strip()]
+
+    @staticmethod
+    def _history_retention_lower_bound(days: int = 30) -> str:
+        return (datetime.now() - timedelta(days=max(1, int(days)))).isoformat(timespec='seconds')
+
+    def _cleanup_old_history(self, conn: sqlite3.Connection, *, retention_days: int = 30) -> None:
+        lower_bound = self._history_retention_lower_bound(retention_days)
+        conn.execute(
+            "DELETE FROM event_history WHERE created_at < ?",
+            (lower_bound,),
+        )
+        conn.execute(
+            "DELETE FROM coroom_state WHERE updated_at < ?",
+            (lower_bound,),
+        )
 
     def upsert_friend_snapshots(self, snapshots: list[FriendSnapshot]) -> None:
         if not snapshots:
@@ -200,6 +216,7 @@ class RadarDB:
                     if str(event.friend_user_id or '').strip()
                 ],
             )
+            self._cleanup_old_history(conn, retention_days=30)
             conn.commit()
         finally:
             conn.close()
@@ -245,6 +262,18 @@ class RadarDB:
             return [self._event_from_row(row) for row in rows]
         finally:
             conn.close()
+
+    def list_events_for_friend_between(
+        self,
+        friend_user_id: str,
+        start_at: str,
+        end_at: str,
+        limit: int = 5000,
+    ) -> list[RadarEvent]:
+        target = str(friend_user_id or '').strip()
+        if not target:
+            return []
+        return self.list_events_between(start_at, end_at, friend_ids=[target], limit=limit)
 
     def event_exists_since(self, dedupe_key: str, created_at_lower_bound: str) -> bool:
         conn = self._connect()

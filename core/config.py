@@ -38,6 +38,8 @@ class PluginConfig:
     daily_report_time: str = DEFAULT_DAILY_TASK_TIME
     daily_report_top_n: int = 5
     world_translation_cache_max_entries: int = 500
+    allow_public_friend_request: bool = False
+    soul_profile_days: int = 7
 
     def __init__(self, raw_config: Any, context: Any):
         self.raw_config = raw_config
@@ -86,6 +88,8 @@ class PluginConfig:
 
         self.daily_report_top_n = max(1, min(20, self._read_int("daily_report_top_n", 5)))
         self.world_translation_cache_max_entries = max(0, self._read_int("world_translation_cache_max_entries", 500))
+        self.allow_public_friend_request = self._read_bool("allow_public_friend_request", False)
+        self.soul_profile_days = max(1, min(30, self._read_int("soul_profile_days", 7)))
 
     def _has_key(self, key: str) -> bool:
         cfg = self.raw_config

@@ -142,6 +142,13 @@ class SettingsRepository:
     def set_daily_report_last_sent_date(self, date_str: str) -> None:
         self._set_raw("daily_report_last_sent_date", (date_str or "").strip())
 
+    def get_allow_public_friend_request(self) -> bool:
+        raw = (self._get_raw("allow_public_friend_request") or "").strip().lower()
+        return raw in {"1", "true", "yes", "on"}
+
+    def set_allow_public_friend_request(self, enabled: bool) -> None:
+        self._set_raw("allow_public_friend_request", "true" if enabled else "false")
+
     def _cleanup_world_desc_translations(self, conn: sqlite3.Connection) -> None:
         max_entries = int(getattr(self.cfg, "world_translation_cache_max_entries", 500) or 0)
         if max_entries <= 0:

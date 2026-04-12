@@ -776,6 +776,33 @@ class VRChatClient:
             return []
 
 
+    async def send_friend_request(self, user_id: str) -> dict:
+        return await asyncio.to_thread(self._send_friend_request_sync, user_id)
+
+    def _send_friend_request_sync(self, user_id: str) -> dict:
+        target = str(user_id or '').strip()
+        if not target:
+            raise VRChatClientError("??????ID")
+        if self._api_client is None:
+            raise VRChatClientError("?????????????")
+        try:
+            from vrchatapi.api import friends_api
+        except ImportError as exc:
+            raise VRChatClientError("?? vrchatapi ??") from exc
+        try:
+            api = friends_api.FriendsApi(self._api_client)
+            resp = api.friend(target, _request_timeout=self._request_timeout_tuple())
+            return {
+                'id': str(getattr(resp, 'id', '') or ''),
+                'type': str(getattr(resp, 'type', '') or ''),
+                'sender_user_id': str(getattr(resp, 'sender_user_id', '') or ''),
+                'receiver_user_id': str(getattr(resp, 'receiver_user_id', '') or ''),
+            }
+        except Exception as exc:
+            if self._is_auth_invalid_exception(exc):
+                self._raise_as_client_error("????????", exc)
+            raise VRChatClientError(f"????????: {exc}") from exc
+
     async def download_image_authenticated(self, url: str, save_path: str) -> str:
         return await asyncio.to_thread(self._download_image_authenticated_sync, url, save_path)
 
