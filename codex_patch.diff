@@ -1,0 +1,114 @@
+﻿*** Begin Patch
+*** Update File: main.py
+@@
+     async def _build_timeline_worlds(self, event_rows: list, snapshot) -> list[dict]:
+         now = datetime.now()
+         max_nodes = 8
+-        timeline: list[tuple[datetime, str]] = []
++        visits: list[tuple[datetime, str]] = []
++        last_world = ''
++        had_break = True
++
++        def push_visit(ts: datetime, world_id: str) -> None:
++            nonlocal last_world, had_break
++            if not world_id:
++                last_world = ''
++                had_break = True
++                return
++            if had_break or world_id != last_world:
++                visits.append((ts, world_id))
++            last_world = world_id
++            had_break = False
++
+         for item in reversed(event_rows):
+             ts_text = str(item.created_at or '').strip()
+             try:
+                 ts = datetime.fromisoformat(ts_text)
+             except Exception:
+                 ts = now
+ 
+             if item.event_type == 'location_changed':
+-                old_world = extract_world_id(item.old_value)
+                 new_world = extract_world_id(item.new_value)
+-                if old_world:
+-                    timeline.append((ts - timedelta(seconds=1), old_world))
+                 if new_world:
+-                    timeline.append((ts, new_world))
++                    push_visit(ts, new_world)
++                elif extract_world_id(item.old_value):
++                    push_visit(ts, '')
+                 continue
+ 
+             value = item.new_value if item.event_type == 'friend_online' else ''
+             world_id = extract_world_id(value)
+             if world_id:
+-                timeline.append((ts, world_id))
++                push_visit(ts, world_id)
+ 
+         if snapshot and snapshot.location:
+             current_world = extract_world_id(snapshot.location)
+             if current_world:
+                 try:
+                     ts = datetime.fromisoformat(snapshot.updated_at) if snapshot.updated_at else now
+                 except Exception:
+                     ts = now
+-                timeline.append((ts, current_world))
+-
+-        collapsed: list[tuple[datetime, str]] = []
+-        last_world = None
+-        for ts, world_id in sorted(timeline, key=lambda item: item[0]):
+-            if not world_id or world_id == last_world:
+-                continue
+-            collapsed.append((ts, world_id))
+-            last_world = world_id
+-
+-        if len(collapsed) <= max_nodes:
+-            picked = collapsed
++                push_visit(ts, current_world)
++
++        if len(visits) <= max_nodes:
++            picked = visits
+         else:
+             picked: list[tuple[datetime, str]] = []
+-            last_index = len(collapsed) - 1
++            last_index = len(visits) - 1
+             for slot in range(max_nodes):
+                 idx = round(slot * last_index / (max_nodes - 1))
+-                item = collapsed[idx]
++                item = visits[idx]
+                 if picked and picked[-1] == item:
+                     continue
+                 picked.append(item)
+-            if picked and picked[-1] != collapsed[-1]:
+-                picked[-1] = collapsed[-1]
++            if picked and picked[-1] != visits[-1]:
++                picked[-1] = visits[-1]
+ 
+-        if len(picked) < min(max_nodes, len(collapsed)):
++        if len(picked) < min(max_nodes, len(visits)):
+             seen = set(picked)
+-            for item in collapsed:
++            for item in visits:
+                 if item in seen:
+                     continue
+                 picked.append(item)
+                 seen.add(item)
+-                if len(picked) >= min(max_nodes, len(collapsed)):
++                if len(picked) >= min(max_nodes, len(visits)):
+                     break
+             picked.sort(key=lambda item: item[0])
+ 
++        same_day = len({item[0].strftime('%Y-%m-%d') for item in picked}) <= 1
++        time_format = '%H:%M' if same_day else '%m/%d'
+         result: list[dict] = []
+         for ts, world_id in picked[:max_nodes]:
+             world_text = await self._format_world_display(world_id)
+             result.append({
+                 'world_id': world_id,
+                 'world_name': world_text,
+                 'short_name': self._short_world_label(world_text),
+-                'time_text': ts.strftime('%m/%d'),
++                'time_text': ts.strftime(time_format),
+             })
+         return result
+*** End Patch

@@ -230,7 +230,20 @@ class VRCFriendRadarPlugin(Star):
     async def _build_timeline_worlds(self, event_rows: list, snapshot) -> list[dict]:
         now = datetime.now()
         max_nodes = 8
-        timeline: list[tuple[datetime, str]] = []
+        visits: list[tuple[datetime, str]] = []
+        last_world = ''
+        had_break = True
+
+        def push_visit(ts: datetime, world_id: str) -> None:
+            nonlocal last_world, had_break
+            if not world_id:
+                last_world = ''
+                had_break = True
+                return
+            if had_break or world_id != last_world:
+                visits.append((ts, world_id))
+            last_world = world_id
+            had_break = False
         for item in reversed(event_rows):
             ts_text = str(item.created_at or '').strip()
             try:
@@ -239,18 +252,17 @@ class VRCFriendRadarPlugin(Star):
                 ts = now
 
             if item.event_type == 'location_changed':
-                old_world = extract_world_id(item.old_value)
                 new_world = extract_world_id(item.new_value)
-                if old_world:
-                    timeline.append((ts - timedelta(seconds=1), old_world))
                 if new_world:
-                    timeline.append((ts, new_world))
+                    push_visit(ts, new_world)
+                elif extract_world_id(item.old_value):
+                    push_visit(ts, '')
                 continue
 
             value = item.new_value if item.event_type == 'friend_online' else ''
             world_id = extract_world_id(value)
             if world_id:
-                timeline.append((ts, world_id))
+                push_visit(ts, world_id)
 
         if snapshot and snapshot.location:
             current_world = extract_world_id(snapshot.location)
@@ -259,41 +271,35 @@ class VRCFriendRadarPlugin(Star):
                     ts = datetime.fromisoformat(snapshot.updated_at) if snapshot.updated_at else now
                 except Exception:
                     ts = now
-                timeline.append((ts, current_world))
+                push_visit(ts, current_world)
 
-        collapsed: list[tuple[datetime, str]] = []
-        last_world = None
-        for ts, world_id in sorted(timeline, key=lambda item: item[0]):
-            if not world_id or world_id == last_world:
-                continue
-            collapsed.append((ts, world_id))
-            last_world = world_id
-
-        if len(collapsed) <= max_nodes:
-            picked = collapsed
+        if len(visits) <= max_nodes:
+            picked = visits
         else:
             picked: list[tuple[datetime, str]] = []
-            last_index = len(collapsed) - 1
+            last_index = len(visits) - 1
             for slot in range(max_nodes):
                 idx = round(slot * last_index / (max_nodes - 1))
-                item = collapsed[idx]
+                item = visits[idx]
                 if picked and picked[-1] == item:
                     continue
                 picked.append(item)
-            if picked and picked[-1] != collapsed[-1]:
-                picked[-1] = collapsed[-1]
+            if picked and picked[-1] != visits[-1]:
+                picked[-1] = visits[-1]
 
-        if len(picked) < min(max_nodes, len(collapsed)):
+        if len(picked) < min(max_nodes, len(visits)):
             seen = set(picked)
-            for item in collapsed:
+            for item in visits:
                 if item in seen:
                     continue
                 picked.append(item)
                 seen.add(item)
-                if len(picked) >= min(max_nodes, len(collapsed)):
+                if len(picked) >= min(max_nodes, len(visits)):
                     break
             picked.sort(key=lambda item: item[0])
 
+        same_day = len({item[0].strftime('%Y-%m-%d') for item in picked}) <= 1
+        time_format = '%H:%M' if same_day else '%m/%d'
         result: list[dict] = []
         for ts, world_id in picked[:max_nodes]:
             world_text = await self._format_world_display(world_id)
@@ -301,7 +307,7 @@ class VRCFriendRadarPlugin(Star):
                 'world_id': world_id,
                 'world_name': world_text,
                 'short_name': self._short_world_label(world_text),
-                'time_text': ts.strftime('%m/%d'),
+                'time_text': ts.strftime(time_format),
             })
         return result
 
@@ -783,23 +789,28 @@ class VRCFriendRadarPlugin(Star):
                 ts = now
             day_marks.add(ts.strftime('%Y-%m-%d'))
             hour_counter[ts.hour] += 1
+            event_worlds: list[tuple[datetime, str]] = []
             if item.event_type == 'location_changed':
                 old_world = extract_world_id(item.old_value)
                 new_world = extract_world_id(item.new_value)
                 if old_world:
-                    timeline_candidates.append((ts - timedelta(seconds=1), old_world))
+                    event_worlds.append((ts - timedelta(seconds=1), old_world))
                 if new_world:
-                    timeline_candidates.append((ts, new_world))
-                world_id = new_world
+                    event_worlds.append((ts, new_world))
+                world_id = new_world or old_world
             else:
-                value = item.new_value if item.event_type == 'friend_online' else ''
-                world_id = extract_world_id(value)
-                if world_id:
-                    timeline_candidates.append((ts, world_id))
+                for raw_value in (item.new_value, item.old_value):
+                    world_id_candidate = extract_world_id(raw_value)
+                    if world_id_candidate:
+                        event_worlds.append((ts, world_id_candidate))
+                world_id = event_worlds[-1][1] if event_worlds else ''
+
+            for candidate_ts, candidate_world in event_worlds:
+                timeline_candidates.append((candidate_ts, candidate_world))
             if world_id:
                 world_counter[world_id] += 1
                 latest_world_ids.append(world_id)
-            loc_key = (item.new_value if item.event_type in {'friend_online', 'location_changed'} else '') or item.new_value or item.old_value or ''
+            loc_key = item.new_value or item.old_value or ''
             if loc_key:
                 location_counter[str(loc_key)] += 1
 
@@ -830,7 +841,8 @@ class VRCFriendRadarPlugin(Star):
             })
 
         timeline_worlds = await self._build_timeline_worlds(events, snapshot)
-        if len(timeline_worlds) <= 2 and len(world_counter) >= 3:
+        timeline_unique_world_count = len({world_id for _, world_id in timeline_candidates if world_id})
+        if len(timeline_worlds) < min(6, timeline_unique_world_count) and timeline_unique_world_count >= 3:
             sampled_candidates: list[tuple[datetime, str]] = []
             last_world = None
             for ts, world_id in sorted(timeline_candidates, key=lambda item: item[0]):
@@ -846,7 +858,7 @@ class VRCFriendRadarPlugin(Star):
                     seen_worlds.add(world_id)
                     sampled_candidates.append((now, world_id))
             if sampled_candidates:
-                max_nodes = min(8, len(sampled_candidates))
+                max_nodes = min(8, max(3, timeline_unique_world_count))
                 if len(sampled_candidates) > max_nodes:
                     picked_candidates: list[tuple[datetime, str]] = []
                     last_index = len(sampled_candidates) - 1
@@ -859,7 +871,18 @@ class VRCFriendRadarPlugin(Star):
                     if picked_candidates and picked_candidates[-1] != sampled_candidates[-1]:
                         picked_candidates[-1] = sampled_candidates[-1]
                 else:
-                    picked_candidates = sampled_candidates
+                    picked_candidates = sampled_candidates[:]
+                if len(picked_candidates) < max_nodes:
+                    picked_candidates.sort(key=lambda item: item[0])
+                    seen_worlds = {world_id for _, world_id in picked_candidates}
+                    for world_id, _count in world_counter.most_common(8):
+                        if not world_id or world_id in seen_worlds:
+                            continue
+                        picked_candidates.append((now, world_id))
+                        seen_worlds.add(world_id)
+                        if len(picked_candidates) >= max_nodes:
+                            break
+                    picked_candidates.sort(key=lambda item: item[0])
                 rebuilt_timeline: list[dict] = []
                 for ts, world_id in picked_candidates[:8]:
                     world_text = await self._format_world_display(world_id)
@@ -980,14 +1003,19 @@ class VRCFriendRadarPlugin(Star):
         right_width = width - margin * 2 - left_width - card_gap
         canvas_height = 1920
 
-        base = PILImage.new('RGBA', (width, canvas_height), (58, 32, 54, 255))
-        cover = self._load_cover_image(summary.card_cover_local_path, (width, canvas_height))
-        if cover is not None:
-            blurred = cover.filter(ImageFilter.GaussianBlur(14)).convert('RGBA')
-            base.alpha_composite(blurred)
-
-        overlay = PILImage.new('RGBA', (width, canvas_height), (92, 42, 78, 150))
+        base = PILImage.new('RGBA', (width, canvas_height), (82, 48, 74, 255))
+        overlay = PILImage.new('RGBA', (width, canvas_height), (138, 76, 116, 54))
         base.alpha_composite(overlay)
+
+        cover_local_path = summary.card_cover_local_path
+        cover = self._load_cover_image(cover_local_path, (width, canvas_height))
+        if cover is None and summary.card_cover_url:
+            refreshed_cover_path = await self._download_image_to_temp(summary.card_cover_url) or ''
+            if refreshed_cover_path:
+                cover_local_path = refreshed_cover_path
+                cover = self._load_cover_image(cover_local_path, (width, canvas_height))
+        if cover is None and summary.card_cover_url:
+            logger.warning(f"[vrc_friend_radar] 灵魂画像封面加载失败: url={summary.card_cover_url} path={cover_local_path}")
 
         accent = PILImage.new('RGBA', (width, canvas_height), (0, 0, 0, 0))
         accent_draw = ImageDraw.Draw(accent)
@@ -1052,18 +1080,17 @@ class VRCFriendRadarPlugin(Star):
             card_height = max(180, body_y + extra_bottom)
             box = (column_x, current_y, column_x + card_width, current_y + card_height)
             self._draw_round_rect(draw, box, 28, card_fill, outline=card_outline, width=2)
-            cover_opacity = 132 if timeline_worlds else 56
-            cover_blur = 1 if timeline_worlds else 5
+            cover_opacity = 0 if timeline_worlds else 56
+            cover_blur = 0 if timeline_worlds else 5
             self._paste_card_cover(panel, cover_image, box, radius=28, opacity=cover_opacity, blur_radius=cover_blur)
             panel_draw = ImageDraw.Draw(panel)
-            inner_fill = (86, 44, 74, 72) if timeline_worlds else (79, 42, 69, 114)
+            inner_fill = (86, 44, 74, 36) if timeline_worlds else (79, 42, 69, 114)
             self._draw_round_rect(panel_draw, box, 28, inner_fill, outline=card_outline, width=2)
             if timeline_worlds:
-                timeline_cover_box = (column_x + 18, current_y + 56, column_x + card_width - 18, current_y + 184)
-                self._paste_card_cover(panel, cover_image, timeline_cover_box, radius=22, opacity=182, blur_radius=0)
+                timeline_cover_box = (column_x + 16, current_y + 54, column_x + card_width - 16, current_y + 194)
+                self._paste_card_cover(panel, cover_image, timeline_cover_box, radius=24, opacity=252, blur_radius=0)
                 panel_draw = ImageDraw.Draw(panel)
-                self._draw_round_rect(panel_draw, timeline_cover_box, 22, (255, 255, 255, 18))
-                self._draw_round_rect(panel_draw, timeline_cover_box, 22, (255, 240, 247, 20))
+                panel_draw.rounded_rectangle(timeline_cover_box, radius=24, outline=(255, 243, 248, 96), width=1)
             panel_draw.text((column_x + 26, current_y + 24), title, font=font_section, fill=text_primary)
             draw_y = current_y + 74
             if timeline_worlds:
@@ -1078,7 +1105,7 @@ class VRCFriendRadarPlugin(Star):
             return box[3] + card_gap
 
         top_world_lines = [summary.resident_label] if summary.resident_label else ['\u6837\u672c\u8fd8\u5728\u79ef\u7d2f\u4e2d\uff0c\u518d\u591a\u966a\u673a\u5668\u4eba\u5f85\u4e00\u4f1a\u513f\u5427\u3002']
-        track_cover = self._load_cover_image(summary.card_cover_local_path, (left_width, 900))
+        track_cover = cover.resize((left_width, 900), PILImage.Resampling.LANCZOS).convert('RGBA') if cover is not None else None
         y_left = draw_card(left_x, y_left, left_width, '\u8f68\u8ff9\u5468\u62a5', top_world_lines, cover_image=track_cover, timeline_worlds=summary.timeline_worlds)
 
         tags_line = '\u3001'.join(summary.style_tags) or '\u6e29\u67d4\u65c5\u884c\u5bb6'
@@ -1448,8 +1475,20 @@ class VRCFriendRadarPlugin(Star):
             self._cleanup_temp_world_logo_files(temp_dir)
             return result
         except Exception as exc:
-            logger.error(f"[vrc_friend_radar] 下载地图Logo失败: {exc}")
-            return None
+            logger.warning(f"[vrc_friend_radar] 认证下载地图Logo失败，尝试公开下载: {exc}")
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    data = resp.read()
+                with open(file_path, 'wb') as f:
+                    f.write(data)
+                self._cleanup_temp_world_logo_files(temp_dir)
+                return str(file_path)
+            except Exception as public_exc:
+                logger.error(f"[vrc_friend_radar] 下载地图Logo失败: {public_exc}")
+                return None
 
     async def _get_world_name(self, location: str | None) -> str:
         world_id = extract_world_id(location)
