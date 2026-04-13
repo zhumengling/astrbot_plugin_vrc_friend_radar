@@ -1807,6 +1807,7 @@ class VRCFriendRadarPlugin(Star):
         now = datetime.now()
         date_text = now.strftime('%Y-%m-%d')
         top_n = self.cfg.daily_report_top_n
+        report_hint = "新增命令 @机器人 vrc灵魂画像 命令可以查看人物画像"
 
         lines = [f"📘 VRChat 监控日报（{date_text}）"]
 
@@ -1818,6 +1819,8 @@ class VRCFriendRadarPlugin(Star):
 
         if not stat_friend_ids:
             lines.append("今日暂无上线好友（基于本地事件与快照）。")
+            lines.append("")
+            lines.append(report_hint)
             return [Plain("\n".join(lines))]
 
         events: list = []
@@ -1866,6 +1869,9 @@ class VRCFriendRadarPlugin(Star):
                 )
         else:
             lines.append("今日热门世界 Top：暂无可用世界数据。")
+
+        lines.append("")
+        lines.append(report_hint)
 
         components = [Plain("\n".join(lines))]
 
@@ -2395,7 +2401,7 @@ class VRCFriendRadarPlugin(Star):
     async def weekly_soul_profile(self, event: AiocqhttpMessageEvent):
         raw = event.message_str.replace("vrc\u7075\u9b42\u753b\u50cf", "", 1).strip()
         if not raw:
-            yield event.plain_result("\u7528\u6cd5\uff1a/vrc\u7075\u9b42\u753b\u50cf \u663e\u793a\u540d")
+            yield event.plain_result("\u7528\u6cd5\uff1a/vrc\u7075\u9b42\u753b\u50cf \u7528\u6237\u540d\u5b57")
             return
         try:
             friend_id, _ = await self._resolve_profile_target_interactive(event, raw, "\u751f\u6210\u7075\u9b42\u753b\u50cf")
