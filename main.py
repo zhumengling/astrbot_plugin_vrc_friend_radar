@@ -229,18 +229,28 @@ class VRCFriendRadarPlugin(Star):
 
     async def _build_timeline_worlds(self, event_rows: list, snapshot) -> list[dict]:
         now = datetime.now()
+        max_nodes = 8
         timeline: list[tuple[datetime, str]] = []
         for item in reversed(event_rows):
-            value = item.new_value if item.event_type in {'friend_online', 'location_changed'} else ''
-            world_id = extract_world_id(value)
-            if not world_id:
-                continue
             ts_text = str(item.created_at or '').strip()
             try:
                 ts = datetime.fromisoformat(ts_text)
             except Exception:
                 ts = now
-            timeline.append((ts, world_id))
+
+            if item.event_type == 'location_changed':
+                old_world = extract_world_id(item.old_value)
+                new_world = extract_world_id(item.new_value)
+                if old_world:
+                    timeline.append((ts - timedelta(seconds=1), old_world))
+                if new_world:
+                    timeline.append((ts, new_world))
+                continue
+
+            value = item.new_value if item.event_type == 'friend_online' else ''
+            world_id = extract_world_id(value)
+            if world_id:
+                timeline.append((ts, world_id))
 
         if snapshot and snapshot.location:
             current_world = extract_world_id(snapshot.location)
@@ -254,18 +264,18 @@ class VRCFriendRadarPlugin(Star):
         collapsed: list[tuple[datetime, str]] = []
         last_world = None
         for ts, world_id in sorted(timeline, key=lambda item: item[0]):
-            if world_id == last_world:
+            if not world_id or world_id == last_world:
                 continue
             collapsed.append((ts, world_id))
             last_world = world_id
 
-        if len(collapsed) <= 7:
+        if len(collapsed) <= max_nodes:
             picked = collapsed
         else:
             picked: list[tuple[datetime, str]] = []
             last_index = len(collapsed) - 1
-            for slot in range(7):
-                idx = round(slot * last_index / 6)
+            for slot in range(max_nodes):
+                idx = round(slot * last_index / (max_nodes - 1))
                 item = collapsed[idx]
                 if picked and picked[-1] == item:
                     continue
@@ -273,8 +283,19 @@ class VRCFriendRadarPlugin(Star):
             if picked and picked[-1] != collapsed[-1]:
                 picked[-1] = collapsed[-1]
 
+        if len(picked) < min(max_nodes, len(collapsed)):
+            seen = set(picked)
+            for item in collapsed:
+                if item in seen:
+                    continue
+                picked.append(item)
+                seen.add(item)
+                if len(picked) >= min(max_nodes, len(collapsed)):
+                    break
+            picked.sort(key=lambda item: item[0])
+
         result: list[dict] = []
-        for ts, world_id in picked[:7]:
+        for ts, world_id in picked[:max_nodes]:
             world_text = await self._format_world_display(world_id)
             result.append({
                 'world_id': world_id,
@@ -284,6 +305,124 @@ class VRCFriendRadarPlugin(Star):
             })
         return result
 
+    def _build_presence_segments(
+        self,
+        event_rows: list,
+        snapshot,
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> list[tuple[datetime, datetime, str]]:
+        current_world = ''
+        ordered_points: list[tuple[datetime, str]] = []
+        for item in reversed(event_rows):
+            value = item.new_value if item.event_type in {'friend_online', 'location_changed'} else ''
+            location_key = extract_world_id(value)
+            ts_text = str(item.created_at or '').strip()
+            try:
+                ts = datetime.fromisoformat(ts_text)
+            except Exception:
+                continue
+            if ts < start_dt:
+                continue
+            if ts > end_dt:
+                break
+            if not location_key:
+                continue
+            if ordered_points and ordered_points[-1][1] == location_key:
+                continue
+            ordered_points.append((ts, location_key))
+
+        if snapshot and snapshot.location:
+            snapshot_world = extract_world_id(snapshot.location)
+            if snapshot_world:
+                current_world = snapshot_world
+                try:
+                    snapshot_ts = datetime.fromisoformat(snapshot.updated_at) if snapshot.updated_at else end_dt
+                except Exception:
+                    snapshot_ts = end_dt
+                snapshot_ts = min(max(snapshot_ts, start_dt), end_dt)
+                if ordered_points:
+                    if snapshot_ts >= ordered_points[-1][0] and ordered_points[-1][1] != snapshot_world:
+                        ordered_points.append((snapshot_ts, snapshot_world))
+                else:
+                    ordered_points.append((snapshot_ts, snapshot_world))
+
+        segments: list[tuple[datetime, datetime, str]] = []
+        for idx, (seg_start, world_id) in enumerate(ordered_points):
+            next_ts = ordered_points[idx + 1][0] if idx + 1 < len(ordered_points) else end_dt
+            seg_from = max(seg_start, start_dt)
+            seg_to = min(next_ts, end_dt)
+            if seg_to <= seg_from or not world_id:
+                continue
+            segments.append((seg_from, seg_to, world_id))
+
+        if not segments and current_world:
+            segments.append((start_dt, end_dt, current_world))
+        return segments
+
+    def _estimate_companion_match(
+        self,
+        target_id: str,
+        snapshot_map: dict[str, object],
+        start_dt: datetime,
+        end_dt: datetime,
+    ) -> tuple[str, str, int, int]:
+        target_snapshot = snapshot_map.get(target_id)
+        target_events = self.db.list_events_for_friend_between(
+            target_id,
+            start_dt.isoformat(timespec='seconds'),
+            end_dt.isoformat(timespec='seconds'),
+            limit=4000,
+        )
+        target_segments = self._build_presence_segments(target_events, target_snapshot, start_dt, end_dt)
+        if not target_segments:
+            return '', '', 0, 0
+
+        best_friend_id = ''
+        best_name = ''
+        best_minutes = 0
+        best_overlap_worlds = 0
+
+        for candidate_id, candidate_snapshot in snapshot_map.items():
+            if candidate_id == target_id:
+                continue
+            candidate_events = self.db.list_events_for_friend_between(
+                candidate_id,
+                start_dt.isoformat(timespec='seconds'),
+                end_dt.isoformat(timespec='seconds'),
+                limit=4000,
+            )
+            candidate_segments = self._build_presence_segments(candidate_events, candidate_snapshot, start_dt, end_dt)
+            if not candidate_segments:
+                continue
+
+            overlap_minutes = 0
+            overlap_worlds: set[str] = set()
+            for left_start, left_end, left_world in target_segments:
+                for right_start, right_end, right_world in candidate_segments:
+                    if left_world != right_world:
+                        continue
+                    overlap_start = max(left_start, right_start)
+                    overlap_end = min(left_end, right_end)
+                    if overlap_end <= overlap_start:
+                        continue
+                    overlap_minutes += int((overlap_end - overlap_start).total_seconds() // 60)
+                    overlap_worlds.add(left_world)
+
+            if overlap_minutes <= 0:
+                continue
+
+            candidate_name = self._sanitize_display_name_for_output(candidate_snapshot.display_name) or candidate_id
+            ranking = (overlap_minutes, len(overlap_worlds), candidate_name.casefold())
+            best_ranking = (best_minutes, best_overlap_worlds, best_name.casefold() if best_name else '')
+            if ranking > best_ranking:
+                best_friend_id = candidate_id
+                best_name = candidate_name
+                best_minutes = overlap_minutes
+                best_overlap_worlds = len(overlap_worlds)
+
+        return best_friend_id, best_name, best_minutes, best_overlap_worlds
+
     def _draw_timeline_branch_card(
         self,
         draw: ImageDraw.ImageDraw,
@@ -292,38 +431,84 @@ class VRCFriendRadarPlugin(Star):
     ) -> None:
         if not timeline_worlds:
             return
-        left = box[0] + 34
-        right = box[2] - 34
+
+        left = box[0] + 28
+        right = box[2] - 28
         center_y = box[1] + 88
-        node_radius = 6
-        branch_height = 20
         count = len(timeline_worlds)
+        node_radius = 6
+
+        def _curve_points(x0: int, y0: int, x1: int, y1: int, lift: int) -> list[tuple[int, int]]:
+            mid_x = (x0 + x1) // 2
+            return [
+                (x0, y0),
+                (x0 + (mid_x - x0) // 2, y0 + lift // 3),
+                (mid_x, y0 + lift),
+                (x1 - (x1 - mid_x) // 2, y1 - lift // 3),
+                (x1, y1),
+            ]
+
         if count <= 1:
             positions = [left + (right - left) // 2]
         else:
             step = (right - left) / (count - 1)
             positions = [int(left + idx * step) for idx in range(count)]
 
-        draw.line((positions[0], center_y, positions[-1], center_y), fill=(255, 231, 243, 150), width=3)
-        label_font = self._get_card_font(18, bold=True)
+        # Main branch: soft blossom-pink glow under a sharper line.
+        draw.line((left, center_y, right, center_y), fill=(255, 232, 244, 82), width=9)
+        draw.line((left, center_y, right, center_y), fill=(255, 214, 232, 176), width=3)
+
+        label_font = self._get_card_font(17, bold=True)
         date_font = self._get_card_font(12)
         for idx, item in enumerate(timeline_worlds):
             x = positions[idx]
             branch_up = idx % 2 == 0
-            end_y = center_y - branch_height if branch_up else center_y + branch_height
-            draw.line((x, center_y, x, end_y), fill=(255, 231, 243, 120), width=2)
-            draw.ellipse((x - node_radius, center_y - node_radius, x + node_radius, center_y + node_radius), fill=(255, 214, 238, 220), outline=(255, 255, 255, 160), width=1)
+            branch_height = 20 + (idx % 3) * 7
+            drift = 10 + (idx % 2) * 3
+            blossom_x = x - drift if branch_up else x + drift
+            blossom_y = center_y - branch_height if branch_up else center_y + branch_height
+            lift = -10 if branch_up else 10
+            branch_points = _curve_points(x, center_y, blossom_x, blossom_y, lift)
+
+            draw.line(branch_points, fill=(255, 235, 244, 96), width=5)
+            draw.line(branch_points, fill=(255, 214, 230, 182), width=2)
+
+            # Root node on the timeline.
+            draw.ellipse(
+                (x - node_radius, center_y - node_radius, x + node_radius, center_y + node_radius),
+                fill=(255, 219, 234, 232),
+                outline=(255, 250, 252, 190),
+                width=1,
+            )
+
+            # Blossom cluster at the branch tip for a sakura-like feel.
+            petal_color = (255, 221, 236, 214)
+            petal_shadow = (255, 188, 214, 118)
+            petal_r = 4
+            for dx, dy in ((0, 0), (-6, -2), (6, -1), (-2, 6), (3, 5)):
+                draw.ellipse(
+                    (blossom_x + dx - petal_r, blossom_y + dy - petal_r, blossom_x + dx + petal_r, blossom_y + dy + petal_r),
+                    fill=petal_color,
+                    outline=(255, 247, 250, 110),
+                    width=1,
+                )
+            draw.ellipse(
+                (blossom_x - 2, blossom_y - 2, blossom_x + 2, blossom_y + 2),
+                fill=petal_shadow,
+            )
+
             short_name = str(item.get('short_name') or '??')[:3]
             label_w, label_h = self._measure_text(draw, short_name, label_font)
-            label_x = x - label_w // 2
-            label_y = end_y - label_h - 8 if branch_up else end_y + 4
-            draw.text((label_x, label_y), short_name, font=label_font, fill=(239, 234, 246))
+            label_x = blossom_x - label_w // 2
+            label_y = blossom_y - label_h - 10 if branch_up else blossom_y + 10
+            draw.text((label_x, label_y), short_name, font=label_font, fill=(255, 245, 251))
+
             time_text = str(item.get('time_text') or '')
             if time_text:
                 time_w, time_h = self._measure_text(draw, time_text, date_font)
-                time_x = x - time_w // 2
-                time_y = label_y - time_h - 3 if branch_up else label_y + label_h + 1
-                draw.text((time_x, time_y), time_text, font=date_font, fill=(188, 193, 213))
+                time_x = blossom_x - time_w // 2
+                time_y = label_y - time_h - 3 if branch_up else label_y + label_h + 2
+                draw.text((time_x, time_y), time_text, font=date_font, fill=(255, 219, 232))
 
     def _pick_active_periods(self, hour_counter: Counter) -> list[str]:
         buckets = {
@@ -588,6 +773,7 @@ class VRCFriendRadarPlugin(Star):
         hour_counter: Counter = Counter()
         day_marks: set[str] = set()
         latest_world_ids: list[str] = []
+        timeline_candidates: list[tuple[datetime, str]] = []
 
         for item in events:
             ts_text = str(item.created_at or '').strip()
@@ -597,12 +783,23 @@ class VRCFriendRadarPlugin(Star):
                 ts = now
             day_marks.add(ts.strftime('%Y-%m-%d'))
             hour_counter[ts.hour] += 1
-            value = item.new_value if item.event_type in {'friend_online', 'location_changed'} else ''
-            world_id = extract_world_id(value)
+            if item.event_type == 'location_changed':
+                old_world = extract_world_id(item.old_value)
+                new_world = extract_world_id(item.new_value)
+                if old_world:
+                    timeline_candidates.append((ts - timedelta(seconds=1), old_world))
+                if new_world:
+                    timeline_candidates.append((ts, new_world))
+                world_id = new_world
+            else:
+                value = item.new_value if item.event_type == 'friend_online' else ''
+                world_id = extract_world_id(value)
+                if world_id:
+                    timeline_candidates.append((ts, world_id))
             if world_id:
                 world_counter[world_id] += 1
                 latest_world_ids.append(world_id)
-            loc_key = value or item.new_value or item.old_value or ''
+            loc_key = (item.new_value if item.event_type in {'friend_online', 'location_changed'} else '') or item.new_value or item.old_value or ''
             if loc_key:
                 location_counter[str(loc_key)] += 1
 
@@ -615,6 +812,8 @@ class VRCFriendRadarPlugin(Star):
                 ts = datetime.fromisoformat(snapshot.updated_at) if snapshot.updated_at else now
             except Exception:
                 ts = now
+            if current_world:
+                timeline_candidates.append((ts, current_world))
             day_marks.add(ts.strftime('%Y-%m-%d'))
             hour_counter[ts.hour] += 1
             location_counter[snapshot.location] += 1
@@ -631,6 +830,47 @@ class VRCFriendRadarPlugin(Star):
             })
 
         timeline_worlds = await self._build_timeline_worlds(events, snapshot)
+        if len(timeline_worlds) <= 2 and len(world_counter) >= 3:
+            sampled_candidates: list[tuple[datetime, str]] = []
+            last_world = None
+            for ts, world_id in sorted(timeline_candidates, key=lambda item: item[0]):
+                if not world_id or world_id == last_world:
+                    continue
+                sampled_candidates.append((ts, world_id))
+                last_world = world_id
+            if len(sampled_candidates) < 3:
+                seen_worlds: set[str] = set()
+                for world_id in latest_world_ids:
+                    if not world_id or world_id in seen_worlds:
+                        continue
+                    seen_worlds.add(world_id)
+                    sampled_candidates.append((now, world_id))
+            if sampled_candidates:
+                max_nodes = min(8, len(sampled_candidates))
+                if len(sampled_candidates) > max_nodes:
+                    picked_candidates: list[tuple[datetime, str]] = []
+                    last_index = len(sampled_candidates) - 1
+                    for slot in range(max_nodes):
+                        idx = round(slot * last_index / max(1, max_nodes - 1))
+                        item = sampled_candidates[idx]
+                        if picked_candidates and picked_candidates[-1] == item:
+                            continue
+                        picked_candidates.append(item)
+                    if picked_candidates and picked_candidates[-1] != sampled_candidates[-1]:
+                        picked_candidates[-1] = sampled_candidates[-1]
+                else:
+                    picked_candidates = sampled_candidates
+                rebuilt_timeline: list[dict] = []
+                for ts, world_id in picked_candidates[:8]:
+                    world_text = await self._format_world_display(world_id)
+                    rebuilt_timeline.append({
+                        'world_id': world_id,
+                        'world_name': world_text,
+                        'short_name': self._short_world_label(world_text),
+                        'time_text': ts.strftime('%m/%d'),
+                    })
+                if len(rebuilt_timeline) > len(timeline_worlds):
+                    timeline_worlds = rebuilt_timeline
 
         active_periods = self._pick_active_periods(hour_counter)
         style_tags = self._pick_style_tags(world_counter, location_counter, len(events) + (1 if snapshot else 0))
@@ -671,6 +911,12 @@ class VRCFriendRadarPlugin(Star):
         cover_url = cover_local = ''
         if cover_world_id:
             cover_url, cover_local = await self._resolve_world_card_assets(cover_world_id)
+        if not cover_local and top_world_rows:
+            fallback_cover_url = str(top_world_rows[0].get('thumbnail') or '')
+            if fallback_cover_url:
+                cover_local = await self._download_image_to_temp(fallback_cover_url) or ''
+                if not cover_url:
+                    cover_url = fallback_cover_url
 
         overview_text = (
             f"\u6700\u8fd1{max(1, len(day_marks))}\u5929\u91cc\uff0c{display_name}\u7559\u4e0b\u4e86{len(events)}\u6761\u53ef\u4ee5\u88ab\u770b\u89c1\u7684\u8db3\u8ff9\uff0c"
@@ -716,7 +962,7 @@ class VRCFriendRadarPlugin(Star):
             quick_commands=[
                 f"/vrc\u4eba\u8bbe {display_name}",
                 f"/\u547d\u8fd0\u6307\u5f15 {display_name}",
-                f"/vrc\u7f18\u5206 {display_name}|\u540d\u5b57B",
+                f"/vrc\u7f18\u5206 {display_name}",
             ],
         )
 
@@ -724,7 +970,7 @@ class VRCFriendRadarPlugin(Star):
         kindred_text = (
             f"\u8fd9 7 \u5929\u91cc\uff0c\u548c {summary.kindred_name} \u7684\u5730\u56fe\u9ed8\u5951\u6700\u9ad8\uff0c\u91cd\u5408\u4e16\u754c {summary.overlap_world_count} \u4e2a\uff0c\u642d\u5b50\u6307\u6570 {summary.kindred_score}/99\u3002"
             if summary.kindred_name != "\u6682\u65f6\u8fd8\u6ca1\u6709"
-            else "\u8fd9\u5468\u8fd8\u6ca1\u6709\u51fa\u73b0\u7279\u522b\u660e\u663e\u7684\u56fa\u5b9a\u642d\u5b50\uff0c\u4f46\u4f60\u7684\u65c5\u884c\u6c14\u8d28\u5df2\u7ecf\u5f88\u5bb9\u6613\u8ba9\u4eba\u60f3\u9760\u8fd1\u3002"
+            else "\u8fd9\u4e00\u5468\u8fd8\u6ca1\u6709\u51fa\u73b0\u7279\u522b\u7a33\u5b9a\u7684\u540c\u884c\u8005\uff0c\u4f46\u4f60\u8eab\u4e0a\u90a3\u79cd\u8ba9\u4eba\u60f3\u9760\u8fd1\u7684\u67d4\u8f6f\u5149\u611f\uff0c\u5df2\u7ecf\u6084\u6084\u628a\u7f18\u5206\u5f80\u4f60\u8fd9\u8fb9\u63a8\u8fc7\u6765\u4e86\u3002"
         )
         width = 1280
         margin = 44
@@ -734,20 +980,21 @@ class VRCFriendRadarPlugin(Star):
         right_width = width - margin * 2 - left_width - card_gap
         canvas_height = 1920
 
-        base = PILImage.new('RGBA', (width, canvas_height), (12, 17, 33, 255))
+        base = PILImage.new('RGBA', (width, canvas_height), (58, 32, 54, 255))
         cover = self._load_cover_image(summary.card_cover_local_path, (width, canvas_height))
         if cover is not None:
             blurred = cover.filter(ImageFilter.GaussianBlur(14)).convert('RGBA')
             base.alpha_composite(blurred)
 
-        overlay = PILImage.new('RGBA', (width, canvas_height), (11, 15, 28, 210))
+        overlay = PILImage.new('RGBA', (width, canvas_height), (92, 42, 78, 150))
         base.alpha_composite(overlay)
 
         accent = PILImage.new('RGBA', (width, canvas_height), (0, 0, 0, 0))
         accent_draw = ImageDraw.Draw(accent)
-        accent_draw.ellipse((-180, -120, 520, 520), fill=(255, 206, 244, 70))
-        accent_draw.ellipse((760, -80, 1380, 520), fill=(147, 214, 255, 60))
-        accent_draw.ellipse((900, 1300, 1440, 1820), fill=(255, 189, 222, 38))
+        accent_draw.ellipse((-200, -160, 560, 560), fill=(255, 213, 235, 108))
+        accent_draw.ellipse((760, -100, 1400, 520), fill=(255, 188, 226, 86))
+        accent_draw.ellipse((880, 1260, 1490, 1880), fill=(255, 234, 245, 42))
+        accent_draw.ellipse((120, 1080, 520, 1560), fill=(255, 178, 218, 36))
         base.alpha_composite(accent)
 
         panel = PILImage.new('RGBA', (width, canvas_height), (0, 0, 0, 0))
@@ -759,11 +1006,11 @@ class VRCFriendRadarPlugin(Star):
         font_section = self._get_card_font(30, bold=True)
         font_quick = self._get_card_font(19)
 
-        text_primary = (246, 240, 255)
-        text_secondary = (219, 223, 240)
-        card_fill = (18, 24, 45, 188)
-        card_outline = (255, 255, 255, 34)
-        tag_fill = (255, 206, 236, 44)
+        text_primary = (255, 245, 252)
+        text_secondary = (255, 229, 240)
+        card_fill = (102, 52, 86, 156)
+        card_outline = (255, 245, 250, 78)
+        tag_fill = (255, 217, 234, 74)
 
         hero_box = (margin, margin, width - margin, margin + hero_height)
         self._draw_round_rect(draw, hero_box, 34, card_fill, outline=card_outline, width=2)
@@ -805,9 +1052,18 @@ class VRCFriendRadarPlugin(Star):
             card_height = max(180, body_y + extra_bottom)
             box = (column_x, current_y, column_x + card_width, current_y + card_height)
             self._draw_round_rect(draw, box, 28, card_fill, outline=card_outline, width=2)
-            self._paste_card_cover(panel, cover_image, box, radius=28, opacity=54, blur_radius=6)
+            cover_opacity = 132 if timeline_worlds else 56
+            cover_blur = 1 if timeline_worlds else 5
+            self._paste_card_cover(panel, cover_image, box, radius=28, opacity=cover_opacity, blur_radius=cover_blur)
             panel_draw = ImageDraw.Draw(panel)
-            self._draw_round_rect(panel_draw, box, 28, (15, 21, 39, 126), outline=card_outline, width=2)
+            inner_fill = (86, 44, 74, 72) if timeline_worlds else (79, 42, 69, 114)
+            self._draw_round_rect(panel_draw, box, 28, inner_fill, outline=card_outline, width=2)
+            if timeline_worlds:
+                timeline_cover_box = (column_x + 18, current_y + 56, column_x + card_width - 18, current_y + 184)
+                self._paste_card_cover(panel, cover_image, timeline_cover_box, radius=22, opacity=182, blur_radius=0)
+                panel_draw = ImageDraw.Draw(panel)
+                self._draw_round_rect(panel_draw, timeline_cover_box, 22, (255, 255, 255, 18))
+                self._draw_round_rect(panel_draw, timeline_cover_box, 22, (255, 240, 247, 20))
             panel_draw.text((column_x + 26, current_y + 24), title, font=font_section, fill=text_primary)
             draw_y = current_y + 74
             if timeline_worlds:
@@ -835,7 +1091,7 @@ class VRCFriendRadarPlugin(Star):
         footer_y = max(y_left, y_right)
         footer_h = 170
         footer_box = (margin, footer_y, width - margin, footer_y + footer_h)
-        self._draw_round_rect(draw, footer_box, 26, (13, 19, 36, 198), outline=card_outline, width=2)
+        self._draw_round_rect(draw, footer_box, 26, (92, 48, 80, 182), outline=card_outline, width=2)
         draw.text((footer_box[0] + 26, footer_box[1] + 20), '\u8f7b\u547d\u4ee4', font=font_section, fill=text_primary)
         chip_x = footer_box[0] + 26
         chip_y = footer_box[1] + 76
@@ -2180,25 +2436,35 @@ class VRCFriendRadarPlugin(Star):
     @filter.command("vrc\u7f18\u5206")
     async def relationship_score(self, event: AiocqhttpMessageEvent):
         raw = event.message_str.replace("vrc\u7f18\u5206", "", 1).strip()
-        left_raw, right_raw = self._split_relationship_targets(raw)
-        if not left_raw or not right_raw:
-            yield event.plain_result("\u7528\u6cd5\uff1a/vrc\u7f18\u5206 \u540d\u5b57A|\u540d\u5b57B \uff08\u4e5f\u652f\u6301 \u201c\u540d\u5b57A \u548c \u540d\u5b57B\u201d\uff09")
+        if not raw:
+            yield event.plain_result("\u7528\u6cd5\uff1a/vrc\u7f18\u5206 \u663e\u793a\u540d")
             return
         try:
-            (left_id, left_name), (right_id, right_name) = await self._resolve_two_profile_targets_interactive(event, left_raw, right_raw)
+            target_id, target_name = await self._resolve_profile_target_interactive(event, raw, "\u5bfb\u627e\u6700\u6709\u7f18\u7684\u4eba")
             now = datetime.now()
-            start_text = (now - timedelta(days=max(1, int(self.cfg.soul_profile_days or 7)))).isoformat(timespec='seconds')
-            end_text = now.isoformat(timespec='seconds')
-            left_events = self.db.list_events_for_friend_between(left_id, start_text, end_text, limit=3000)
-            right_events = self.db.list_events_for_friend_between(right_id, start_text, end_text, limit=3000)
-            left_worlds = {extract_world_id(item.new_value) for item in left_events if extract_world_id(item.new_value)}
-            right_worlds = {extract_world_id(item.new_value) for item in right_events if extract_world_id(item.new_value)}
-            overlap = len(left_worlds & right_worlds)
-            score = min(99, overlap * 25 + min(len(left_events), len(right_events)))
-            if overlap <= 0:
-                yield event.plain_result(f"{left_name} \u548c {right_name} \u8fd9 7 \u5929\u6682\u65f6\u8fd8\u6ca1\u6709\u660e\u663e\u7684\u540c\u56fe\u8f68\u8ff9\u91cd\u5408\uff0c\u50cf\u662f\u4e24\u9897\u8fd8\u6ca1\u6b63\u5f0f\u649e\u8f68\u7684\u5c0f\u884c\u661f\u3002")
+            days = max(1, int(self.cfg.soul_profile_days or 7))
+            start_dt = now - timedelta(days=days)
+            snapshot_map = self.db.get_friend_snapshot_map()
+            partner_id, partner_name, overlap_minutes, overlap_worlds = self._estimate_companion_match(
+                target_id,
+                snapshot_map,
+                start_dt,
+                now,
+            )
+            if not partner_id or overlap_minutes <= 0:
+                yield event.plain_result(f"{target_name} \u6700\u8fd1 {days} \u5929\u8fd8\u6ca1\u6709\u627e\u5230\u7279\u522b\u7a33\u5b9a\u7684\u540c\u6e38\u5bf9\u8c61\uff0c\u50cf\u662f\u5728\u7b49\u4e00\u6bb5\u66f4\u521a\u597d\u7684\u7f18\u5206\u6162\u6162\u9760\u8fd1\u3002")
                 return
-            yield event.plain_result(f"{left_name} \u548c {right_name} \u7684\u7f18\u5206\u6307\u6570\u662f {score}/99\uff0c\u8fd1 7 \u5929\u5171\u8def\u8fc7 {overlap} \u4e2a\u76f8\u540c\u4e16\u754c\uff0c\u642d\u5b50\u6c14\u573a\u5df2\u7ecf\u6709\u70b9\u6084\u6084\u5bf9\u4e0a\u5566\u3002")
+
+            score = min(99, max(36, overlap_worlds * 18 + overlap_minutes // 18))
+            hours = overlap_minutes // 60
+            minutes = overlap_minutes % 60
+            duration_text = f"{hours}\u5c0f\u65f6{minutes}\u5206\u949f" if hours else f"{minutes}\u5206\u949f"
+            yield event.plain_result(
+                f"\u59fb\u7f18\u7b7e\uff1a\u8fd1 {days} \u5929\u91cc\uff0c{target_name} \u547d\u76d8\u91cc\u6700\u5bb9\u6613\u548c {partner_name} \u76f8\u4e92\u7167\u4eae\u3002\n"
+                f"\u7b7e\u6587\u663e\u793a\uff0c\u4f60\u4eec\u5728\u76f8\u8fd1\u5730\u56fe\u91cc\u7d2f\u79ef\u76f8\u4f34\u7ea6 {duration_text}\uff0c\u91cd\u5408\u4e16\u754c {overlap_worlds} \u5904\uff0c\u59fb\u7f18\u503c\u7ea6\u4e3a {score}/99\u3002\n"
+                f"\u8fd9\u662f\u4e00\u652f\u201c\u6162\u70ed\u540c\u5fc3\u7b7e\u201d\uff0c\u7f18\u5206\u4e0d\u662f\u4e00\u773c\u60ca\u8273\uff0c\u800c\u662f\u6b21\u6b21\u540c\u8def\u540e\u60c5\u7eea\u6084\u6084\u843d\u5728\u540c\u4e00\u4e2a\u8282\u62cd\u91cc\u3002"
+                f"\u82e5\u8fd9\u6bb5\u7f18\u7ebf\u7ee7\u7eed\u5f80\u524d\u8d70\uff0c\u5f88\u5bb9\u6613\u4ece\u201c\u521a\u597d\u540c\u884c\u201d\u6162\u6162\u957f\u6210\u201c\u4e92\u76f8\u60e6\u8bb0\u201d\u7684\u67d4\u8f6f\u6545\u4e8b\u3002"
+            )
         except VRChatClientError as exc:
             yield event.plain_result(f"\u8ba1\u7b97\u7f18\u5206\u6307\u6570\u5931\u8d25\uff1a{exc}")
 
