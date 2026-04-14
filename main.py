@@ -941,9 +941,10 @@ class VRCFriendRadarPlugin(Star):
                 if not cover_url:
                     cover_url = fallback_cover_url
 
+        top_world_names = '、'.join(item['world_name'] for item in top_world_rows[:2]) or '柔软角落'
         overview_text = (
             f"\u6700\u8fd1{max(1, len(day_marks))}\u5929\u91cc\uff0c{display_name}\u7559\u4e0b\u4e86{len(events)}\u6761\u53ef\u4ee5\u88ab\u770b\u89c1\u7684\u8db3\u8ff9\uff0c"
-            f"\u6700\u5e38\u505c\u7559\u5728{'\u3001'.join(item['world_name'] for item in top_world_rows[:2]) or '\u67d4\u8f6f\u89d2\u843d'}\u3002"
+            f"\u6700\u5e38\u505c\u7559\u5728{top_world_names}\u3002"
         )
         summary_payload = {
             'display_name': display_name,
@@ -1109,7 +1110,14 @@ class VRCFriendRadarPlugin(Star):
         y_left = draw_card(left_x, y_left, left_width, '\u8f68\u8ff9\u5468\u62a5', top_world_lines, cover_image=track_cover, timeline_worlds=summary.timeline_worlds)
 
         tags_line = '\u3001'.join(summary.style_tags) or '\u6e29\u67d4\u65c5\u884c\u5bb6'
-        y_right = draw_card(right_x, y_right, right_width, '\u6d3b\u8dc3\u65f6\u6bb5\u4e0e\u65c5\u884c\u6807\u7b7e', [f"\u6d3b\u8dc3\u65f6\u6bb5\uff1a{'\u3001'.join(summary.active_periods) or '\u884c\u8e2a\u8f7b\u76c8'}", f"\u65c5\u884c\u6807\u7b7e\uff1a{tags_line}"])
+        active_periods_text = '\u3001'.join(summary.active_periods) or '\u884c\u8e2a\u8f7b\u76c8'
+        y_right = draw_card(
+            right_x,
+            y_right,
+            right_width,
+            '\u6d3b\u8dc3\u65f6\u6bb5\u4e0e\u65c5\u884c\u6807\u7b7e',
+            [f"\u6d3b\u8dc3\u65f6\u6bb5\uff1a{active_periods_text}", f"\u65c5\u884c\u6807\u7b7e\uff1a{tags_line}"],
+        )
         y_left = draw_card(left_x, y_left, left_width, '\u7075\u9b42\u5370\u8bb0', [summary.ai_persona_text])
         y_right = draw_card(right_x, y_right, right_width, '\u547d\u8fd0\u6307\u5f15', [summary.ai_fortune_text])
         y_left = draw_card(left_x, y_left, left_width, '\u65c5\u9014\u540c\u9891', [kindred_text])
@@ -1189,6 +1197,19 @@ class VRCFriendRadarPlugin(Star):
         if not text:
             return
         await self._push_login_notice_to_admins(text)
+
+    def _track_background_task(self, task: asyncio.Task, label: str) -> None:
+        def _done(done_task: asyncio.Task) -> None:
+            try:
+                done_task.result()
+            except asyncio.CancelledError:
+                logger.info(f"[vrc_friend_radar] 后台任务已取消: {label}")
+            except VRChatTwoFactorRequiredError as exc:
+                logger.info(f"[vrc_friend_radar] 后台登录任务结束于额外验证阶段: {label} | method={exc.method}")
+            except Exception as exc:
+                logger.warning(f"[vrc_friend_radar] 后台任务异常结束: {label} | {exc}", exc_info=True)
+
+        task.add_done_callback(_done)
 
     def _remember_private_admin_sender(self, event: AiocqhttpMessageEvent) -> None:
         if not self._is_private_event(event):
@@ -1499,7 +1520,14 @@ class VRCFriendRadarPlugin(Star):
             logger.info(f"[vrc_friend_radar] 世界缓存命中: {world_id}")
             return cached['name']
         logger.info(f"[vrc_friend_radar] 世界缓存未命中，开始拉取世界信息: {world_id}")
-        info = await self.monitor.client.get_world_info(world_id)
+        try:
+            info = await self.monitor.client.get_world_info(world_id)
+        except VRChatClientError as exc:
+            logger.warning(f"[vrc_friend_radar] 获取世界信息失败，将使用兜底名称: world={world_id} err={exc}")
+            return '某个世界'
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 获取世界信息异常，将使用兜底名称: world={world_id} err={exc}")
+            return '某个世界'
         if info and info.get('name'):
             self.world_cache.set(world_id, info)
             return info['name']
@@ -1719,7 +1747,14 @@ class VRCFriendRadarPlugin(Star):
             return cached
         if not self.monitor.client.is_logged_in():
             return {}
-        info = await self.monitor.client.get_world_info(world_id)
+        try:
+            info = await self.monitor.client.get_world_info(world_id)
+        except VRChatClientError as exc:
+            logger.warning(f"[vrc_friend_radar] 获取世界详情失败，跳过实时补全: world={world_id} err={exc}")
+            return {}
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 获取世界详情异常，跳过实时补全: world={world_id} err={exc}")
+            return {}
         if info:
             self.world_cache.set(world_id, info)
             return info
@@ -1910,7 +1945,6 @@ class VRCFriendRadarPlugin(Star):
             lines.append("今日热门世界 Top：暂无可用世界数据。")
 
         lines.append("")
-        lines.append(report_hint)
 
         components = [Plain("\n".join(lines))]
 
@@ -1937,6 +1971,7 @@ class VRCFriendRadarPlugin(Star):
                         components.append(Image.fromFileSystem(local_img))
                     except Exception as exc:
                         logger.error(f"[vrc_friend_radar] 世界推荐图片发送失败: {exc}")
+        components.append(Plain(report_hint))
         return components
 
     def _get_daily_task_last_sent_date(self, task_name: str) -> str:
@@ -1960,8 +1995,15 @@ class VRCFriendRadarPlugin(Star):
         return True
 
     async def _send_daily_report_to_notify_groups(self, mark_sent: bool = True) -> int:
-        components = await self._build_daily_report_components()
-        success = await self._push_chain_to_notify_groups(components)
+        try:
+            components = await self._build_daily_report_components()
+            success = await self._push_chain_to_notify_groups(components)
+        except VRChatClientError as exc:
+            logger.warning(f"[vrc_friend_radar] 日报构建或推送失败（认证/接口异常）: {exc}")
+            return 0
+        except Exception as exc:
+            logger.error(f"[vrc_friend_radar] 日报构建或推送异常: {exc}", exc_info=True)
+            return 0
         if success > 0 and mark_sent:
             today = datetime.now().strftime('%Y-%m-%d')
             self._set_daily_task_last_sent_date('daily_report', today)
@@ -2076,7 +2118,15 @@ class VRCFriendRadarPlugin(Star):
         if not self.monitor.client.is_logged_in():
             yield event.plain_result("当前未登录，无法搜索地图。")
             return
-        results = await self.monitor.client.search_worlds(keyword, limit=5, offset=0)
+        try:
+            results = await self.monitor.client.search_worlds(keyword, limit=5, offset=0)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"搜索地图失败：{exc}")
+            return
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 搜索地图异常: {exc}")
+            yield event.plain_result("搜索地图时发生异常，请稍后重试。")
+            return
         if not results:
             yield event.plain_result("没有搜索到匹配地图。")
             return
@@ -2206,8 +2256,16 @@ class VRCFriendRadarPlugin(Star):
         )
         session_key = self._build_session_key(event)
         timeout_seconds = self.cfg.login_session_timeout_seconds
+        attempt_id = self.monitor.create_manual_login_attempt()
         yield event.plain_result("已收到登录请求，正在连接 VRChat，请稍候…")
-        login_task = asyncio.create_task(self.monitor.test_login(username=username, password=password))
+        login_task = asyncio.create_task(
+            self.monitor.test_login(
+                username=username,
+                password=password,
+                attempt_id=attempt_id,
+            )
+        )
+        self._track_background_task(login_task, f"manual_login:{session_key}")
         try:
             try:
                 result = await asyncio.wait_for(asyncio.shield(login_task), timeout=10)
@@ -2216,17 +2274,17 @@ class VRCFriendRadarPlugin(Star):
                 try:
                     result = await asyncio.wait_for(asyncio.shield(login_task), timeout=max(5, timeout_seconds))
                 except asyncio.TimeoutError:
-                    login_task.cancel()
+                    self.monitor.abandon_manual_login_attempt(attempt_id)
                     logger.error(f"[vrc_friend_radar] 登录任务超时(>10s + {max(5, timeout_seconds)}s)，后台线程可能阻塞")
-                    yield event.plain_result("登录长时间未完成，已停止本次等待。请稍后重试；若持续复现，请查看日志中的登录阶段(stage)定位卡点。")
+                    yield event.plain_result("登录长时间未完成，已放弃本次等待；即使后台任务稍后结束，也不会覆盖当前会话。请稍后重试；若持续复现，请查看日志中的登录阶段(stage)定位卡点。")
                     return
             yield event.plain_result(f"VRChat 登录成功\n用户ID: {result.user_id}\n显示名: {result.display_name}")
             for message in await self._post_login_auto_sync_and_reply(event):
                 yield event.plain_result(message)
         except asyncio.TimeoutError:
-            login_task.cancel()
+            self.monitor.abandon_manual_login_attempt(attempt_id)
             logger.error("[vrc_friend_radar] 登录流程超时（等待初始10秒提示阶段）")
-            yield event.plain_result("登录请求超时，请稍后重试。若持续超时，请检查网络或 VRChat 服务状态。")
+            yield event.plain_result("登录请求超时，已放弃本次等待且不会污染当前会话。若持续超时，请检查网络或 VRChat 服务状态。")
         except VRChatTwoFactorRequiredError as exc:
             self.monitor.create_pending_login(session_key=session_key, username=username, password=password, method=exc.method)
             if exc.method == "totp_or_recovery":
@@ -2267,10 +2325,17 @@ class VRCFriendRadarPlugin(Star):
         if not pending:
             yield event.plain_result("当前没有等待验证的登录会话，请先发送：/vrc登录 用户名 密码")
             return
+        attempt_id = self.monitor.create_manual_login_attempt()
         yield event.plain_result("已收到验证码，正在提交验证，请稍候…")
         login_task = asyncio.create_task(
-            self.monitor.test_login(username=pending.username, password=pending.password, two_factor_code=code)
+            self.monitor.test_login(
+                username=pending.username,
+                password=pending.password,
+                two_factor_code=code,
+                attempt_id=attempt_id,
+            )
         )
+        self._track_background_task(login_task, f"manual_login_2fa:{pending_key}")
         try:
             try:
                 result = await asyncio.wait_for(asyncio.shield(login_task), timeout=10)
@@ -2279,18 +2344,18 @@ class VRCFriendRadarPlugin(Star):
                 try:
                     result = await asyncio.wait_for(asyncio.shield(login_task), timeout=max(5, self.cfg.login_session_timeout_seconds))
                 except asyncio.TimeoutError:
-                    login_task.cancel()
+                    self.monitor.abandon_manual_login_attempt(attempt_id)
                     logger.error(f"[vrc_friend_radar] 验证码提交任务超时(>10s + {max(5, self.cfg.login_session_timeout_seconds)}s)，后台线程可能阻塞")
-                    yield event.plain_result("验证码提交后长时间未完成，已停止本次等待。请重试 /vrc验证码 123456，必要时重新 /vrc登录。")
+                    yield event.plain_result("验证码提交后长时间未完成，已放弃本次等待；即使后台任务稍后结束，也不会覆盖当前会话。请重试 /vrc验证码 123456，必要时重新 /vrc登录。")
                     return
             self.monitor.pop_pending_login(pending_key)
             yield event.plain_result(f"VRChat 登录成功\n用户ID: {result.user_id}\n显示名: {result.display_name}")
             for message in await self._post_login_auto_sync_and_reply(event):
                 yield event.plain_result(message)
         except asyncio.TimeoutError:
-            login_task.cancel()
+            self.monitor.abandon_manual_login_attempt(attempt_id)
             logger.error("[vrc_friend_radar] 验证码流程超时（等待初始10秒提示阶段）")
-            yield event.plain_result("验证码验证超时，请稍后重试 /vrc验证码。若仍失败，可重新执行 /vrc登录。")
+            yield event.plain_result("验证码验证超时，已放弃本次等待且不会污染当前会话。若仍失败，可重新执行 /vrc登录。")
         except VRChatClientError as exc:
             logger.error(f"[vrc_friend_radar] 验证码登录失败: {exc}")
             if isinstance(exc, VRChatNetworkError):
@@ -2428,7 +2493,15 @@ class VRCFriendRadarPlugin(Star):
             else:
                 yield event.plain_result(f"已向 {sent} 个通知群推送日报（手动推送不计入自动去重日期）。")
             return
-        components = await self._build_daily_report_components()
+        try:
+            components = await self._build_daily_report_components()
+        except VRChatClientError as exc:
+            yield event.plain_result(f"生成日报失败：{exc}")
+            return
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 生成日报异常: {exc}")
+            yield event.plain_result("生成日报时发生异常，请稍后重试。")
+            return
         yield event.chain_result(components)
 
     async def _build_public_soul_profile_image(self, event: AiocqhttpMessageEvent, raw_target: str) -> str:

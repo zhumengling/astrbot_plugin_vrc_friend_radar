@@ -84,6 +84,7 @@ class MonitorService:
         self._last_self_snapshot_success_at: float = 0.0
         self._self_snapshot_failure_streak: int = 0
         self._post_login_cooldown_until: float = 0.0
+        self._manual_login_attempts: set[str] = set()
 
     def _recreate_client(self, preserve_credentials: bool = True) -> None:
         username = password = ""
@@ -94,6 +95,21 @@ class MonitorService:
         if preserve_credentials and username and password:
             self.client._username = username
             self.client._password = password
+
+    def create_manual_login_attempt(self) -> str:
+        attempt_id = f"manual-login-{time.time_ns()}"
+        self._manual_login_attempts.add(attempt_id)
+        return attempt_id
+
+    def abandon_manual_login_attempt(self, attempt_id: str | None) -> None:
+        target = str(attempt_id or '').strip()
+        if target:
+            self._manual_login_attempts.discard(target)
+
+    def _adopt_logged_in_client(self, logged_in_client: VRChatClient) -> None:
+        previous_client = self.client
+        self.client = logged_in_client
+        previous_client.close()
 
     async def try_restore_session(self) -> bool:
         data = self.session_store.load()
@@ -588,19 +604,53 @@ class MonitorService:
             except asyncio.TimeoutError:
                 continue
 
-    async def test_login(self, username: str, password: str, two_factor_code: str | None = None) -> LoginResult:
-        result = await self.client.login(username=username, password=password, two_factor_code=two_factor_code)
-        self._last_login_result = result
-        self.persist_session(force=True)
+    async def test_login(
+        self,
+        username: str,
+        password: str,
+        two_factor_code: str | None = None,
+        attempt_id: str | None = None,
+    ) -> LoginResult:
+        temp_client = VRChatClient(self.cfg.vrchat_user_agent)
+        attempt_key = str(attempt_id or '').strip()
+        adopted_client = False
+        try:
+            result = await temp_client.login(
+                username=username,
+                password=password,
+                two_factor_code=two_factor_code,
+            )
+            if attempt_key and attempt_key not in self._manual_login_attempts:
+                logger.warning(
+                    '[vrc_friend_radar] 手动登录任务已完成，但等待已被放弃；本次结果将被丢弃，不写入当前会话。attempt_id=%s',
+                    attempt_key,
+                )
+                temp_client.close()
+                raise asyncio.CancelledError('manual login attempt abandoned')
 
-        if self.cfg.watch_self:
-            await self._safe_fetch_self_snapshot(stage='manual_login_post_auth', trigger_recover_if_auth_invalid=False)
+            self._adopt_logged_in_client(temp_client)
+            adopted_client = True
+            self._last_login_result = result
+            self.persist_session(force=True)
 
-        self._post_login_cooldown_until = time.time() + 60
-        self._last_health_check_at = time.time()
-        self._reset_auto_recover_2fa_waiting()
-        logger.info('[vrc_friend_radar] 登录成功，已设置 60 秒冷却期及健康检查计时重置')
-        return result
+            if self.cfg.watch_self:
+                await self._safe_fetch_self_snapshot(
+                    stage='manual_login_post_auth',
+                    trigger_recover_if_auth_invalid=False,
+                )
+
+            self._post_login_cooldown_until = time.time() + 60
+            self._last_health_check_at = time.time()
+            self._reset_auto_recover_2fa_waiting()
+            logger.info('[vrc_friend_radar] 登录成功，已设置 60 秒冷却期及健康检查计时重置')
+            return result
+        except Exception:
+            if not adopted_client:
+                temp_client.close()
+            raise
+        finally:
+            if attempt_key:
+                self._manual_login_attempts.discard(attempt_key)
 
     async def sync_friends(self) -> list[FriendSnapshot]:
         async with self._poll_lock:
@@ -678,9 +728,37 @@ class MonitorService:
                     merged[self_snapshot.friend_user_id] = self_snapshot
                     new_snapshots = list(merged.values())
 
+            current_self_id = resolved_self_id or (self.client.get_current_user_id() or '').strip()
+            new_snapshot_map = {item.friend_user_id: item for item in new_snapshots}
+            synth_updated_at = datetime.now().isoformat(timespec='seconds')
+            for friend_id, old_item in old_map.items():
+                if friend_id in new_snapshot_map:
+                    continue
+                if current_self_id and friend_id == current_self_id:
+                    continue
+                old_status = str(old_item.status or '').strip().lower()
+                old_location = str(old_item.location or '').strip().lower()
+                if old_status == 'offline' and old_location in {'', 'offline'}:
+                    continue
+                synthetic = FriendSnapshot(
+                    friend_user_id=friend_id,
+                    display_name=old_item.display_name or friend_id,
+                    status='offline',
+                    location='offline',
+                    status_description=old_item.status_description,
+                    updated_at=synth_updated_at,
+                )
+                new_snapshots.append(synthetic)
+                new_snapshot_map[friend_id] = synthetic
+                logger.warning(
+                    '[vrc_friend_radar] watched friend missing from API response, synthesized offline snapshot: friend_id=%s old_status=%s old_location=%s',
+                    friend_id,
+                    old_item.status,
+                    old_item.location,
+                )
+
             new_snapshots = [item for item in new_snapshots if item.friend_user_id in watch_set]
 
-            current_self_id = resolved_self_id or (self.client.get_current_user_id() or '').strip()
             new_map = {item.friend_user_id: item for item in new_snapshots}
             if self.cfg.watch_self:
                 if not current_self_id:
