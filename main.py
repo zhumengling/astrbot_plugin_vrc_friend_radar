@@ -32,7 +32,7 @@ from .core.repository import SearchRepository, SettingsRepository
 from .core.search_state import SearchSession
 from .core.bilibili_parser import BilibiliParser, BilibiliParseError
 from .core.utils import extract_world_id, format_location, infer_joinability
-from .core.vrchat_client import VRChatClientError, VRChatNetworkError, VRChatTwoFactorRequiredError
+from .core.vrchat_client import VRChatClientError, VRChatNetworkError, VRChatRateLimitedError, VRChatTwoFactorRequiredError
 from .core.world_cache import WorldCache
 
 
@@ -3233,6 +3233,13 @@ class VRCFriendRadarPlugin(Star):
             return
         try:
             await self.monitor.client.boop_user(target, emoji_id or None)
+        except VRChatRateLimitedError as exc:
+            wait = exc.retry_after_seconds or 60
+            yield event.plain_result(
+                f"稍等一下再戳～{display_name} 的 Boop 正在冷却中（约 {wait} 秒）。"
+                f"VRChat 对同一好友的 Boop 有服务端冷却窗口。"
+            )
+            return
         except VRChatClientError as exc:
             yield event.plain_result(f"戳一戳失败：{exc}")
             return

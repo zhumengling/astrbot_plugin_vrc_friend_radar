@@ -32,6 +32,13 @@ class VRChatNetworkError(VRChatClientError):
     pass
 
 
+class VRChatRateLimitedError(VRChatClientError):
+    """HTTP 429 / 服务端冷却窗口内。携带建议的等待秒数。"""
+    def __init__(self, message: str, *, retry_after_seconds: int | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = int(retry_after_seconds) if retry_after_seconds else None
+
+
 @dataclass(slots=True)
 class LoginResult:
     ok: bool
@@ -48,6 +55,10 @@ class VRChatClient:
         self._api_client = None
         self._configuration = None
         self._username = ""
+        # VRChat 对 Boop 同目标有服务端冷却（通常 30-60 秒），这里做本地二次兜底，
+        # 避免 LLM 一直重试触发 429。key=user_id, value=下一次允许 boop 的时间戳
+        self._boop_next_allowed_ts: dict[str, float] = {}
+        self._boop_min_interval_seconds = 45.0
         self._password = ""
         self._current_user_id = ""
         self._current_user_display_name = ""
@@ -91,7 +102,7 @@ class VRChatClient:
         text = VRChatClient._build_exception_text(exc)
         if not text:
             return None
-        match = re.search(r'\b(401|403)\b', text)
+        match = re.search(r'\b(401|403|429)\b', text)
         if match:
             try:
                 return int(match.group(1))
@@ -1217,11 +1228,23 @@ class VRChatClient:
             raise VRChatClientError("缺少目标用户 ID")
         if self._api_client is None:
             raise VRChatClientError("尚未登录")
+
+        # ---- 本地冷却：同目标短时间内第二次 boop 直接拒绝，不打 VRChat 服务 ----
+        now_ts = time.time()
+        next_allowed = self._boop_next_allowed_ts.get(target, 0.0)
+        if next_allowed > now_ts:
+            wait = int(next_allowed - now_ts) + 1
+            raise VRChatRateLimitedError(
+                f"刚刚才戳过对方，请等 {wait} 秒后再试（VRChat 服务端对同一目标的 Boop 有冷却）。",
+                retry_after_seconds=wait,
+            )
+
         try:
             from vrchatapi.api import friends_api
             from vrchatapi.models.boop_request import BoopRequest
         except ImportError as exc:
             raise VRChatClientError("当前 vrchatapi SDK 不支持 boop 接口，请升级依赖") from exc
+
         try:
             api = friends_api.FriendsApi(self._api_client)
             payload_kwargs: dict = {}
@@ -1233,14 +1256,35 @@ class VRChatClient:
             except TypeError:
                 payload = BoopRequest()
             resp = api.boop(target, payload, _request_timeout=self._request_timeout_tuple())
-            return {
-                'ok': True,
-                'raw': getattr(resp, 'to_dict', lambda: {})() if resp is not None else {},
-            }
         except Exception as exc:
+            status = self._extract_status_code(exc)
+            if status == 429:
+                # 尝试从 header 读 Retry-After
+                retry_after = None
+                try:
+                    headers = getattr(exc, 'headers', None) or {}
+                    header_val = headers.get('Retry-After') if hasattr(headers, 'get') else None
+                    if header_val:
+                        retry_after = int(str(header_val).strip())
+                except Exception:
+                    retry_after = None
+                wait = retry_after if retry_after else int(self._boop_min_interval_seconds)
+                # 把"下次允许时间"推到服务端建议值
+                self._boop_next_allowed_ts[target] = time.time() + wait
+                raise VRChatRateLimitedError(
+                    f"VRChat 对这位好友的 Boop 正在冷却中（HTTP 429），请等约 {wait} 秒后再试。",
+                    retry_after_seconds=wait,
+                ) from exc
             if self._is_auth_invalid_exception(exc):
                 self._raise_as_client_error("发送 boop 互动失败", exc)
             raise VRChatClientError(f"发送 boop 互动失败: {exc}") from exc
+
+        # 成功才设置本地冷却窗口
+        self._boop_next_allowed_ts[target] = time.time() + self._boop_min_interval_seconds
+        return {
+            'ok': True,
+            'raw': getattr(resp, 'to_dict', lambda: {})() if resp is not None else {},
+        }
 
     async def get_user_detail(self, user_id: str) -> dict | None:
         """调用 UsersApi.get_user 获取目标用户公开资料。"""

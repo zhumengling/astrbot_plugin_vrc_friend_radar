@@ -37,16 +37,19 @@
 2. **VRChat 的 Boop 没有文字消息**
    Boop 只能携带一个 emoji。如果用户说"戳 Alice 并告诉她 xxx"，不要把"xxx"当文字塞给 Boop；只能调用 `vrc_boop(query="Alice")` 并在回复中说明 Boop 不支持文字。
 
-3. **`vrc_send_friend_request` 需要管理员开启 "公共加好友" 开关**
+3. **遇到限流（HTTP 429 / RATE_LIMITED）不要重试**
+   `vrc_boop` 返回的字符串里如果出现 `[RATE_LIMITED]` 或 "冷却" / "429" / "请等 X 秒" 等字样，**必须直接把原文转告用户，停止这一轮调用**。不要换 emoji、不要换参数、不要过几秒再调一次——VRChat 会按 userId 计冷却，重试只会触发更严格的限流。`vrc_send_friend_request` / `vrc_invite_user` 同理。
+
+4. **`vrc_send_friend_request` 需要管理员开启 "公共加好友" 开关**
    如果工具返回 "管理员还没有开启..."，把原文转告用户，并提示管理员通过 `/vrc公共加好友 开启` 开启。
 
-4. **需要先同步好友缓存**
+5. **需要先同步好友缓存**
    本地工具查不到人时，工具会提示 "可先执行 /vrc同步好友"。把这行提示原样转给用户，不要自己瞎猜。
 
-5. **不要遍历调用工具**
+6. **不要遍历调用工具**
    比如用户问 "XX 怎么样"，一次 `vrc_friend_status` 就够，不要连续 `vrc_user_profile`+`vrc_friend_history`+`vrc_instance_info` 全拉一遍。
 
-6. **工具返回的文本已经是面向用户的友好格式**
+7. **工具返回的文本已经是面向用户的友好格式**
    直接把工具返回的文字整合进你的回复即可，不用再二次加工成 JSON 或表格。
 
 ---

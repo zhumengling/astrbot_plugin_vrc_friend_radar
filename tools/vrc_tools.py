@@ -32,6 +32,8 @@ from typing import Any
 from astrbot.api import FunctionTool, logger
 from astrbot.api.event import AstrMessageEvent
 
+from ..core.vrchat_client import VRChatRateLimitedError
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -602,6 +604,12 @@ class VRCBoopTool(FunctionTool):
             return err
         try:
             await plugin.monitor.client.boop_user(friend_id, emoji_id or None)
+        except VRChatRateLimitedError as exc:
+            wait = exc.retry_after_seconds or 60
+            return (
+                f'[RATE_LIMITED] 戳 {display_name} 被 VRChat 限流，需要等 {wait} 秒。'
+                f'不要立刻重试本工具，请直接把这条消息转告用户。'
+            )
         except Exception as exc:
             return f'戳一戳失败：{exc}'
         suffix = f"，带上了 emoji：{emoji_id}" if emoji_id else '（纯戳，没带 emoji）'
