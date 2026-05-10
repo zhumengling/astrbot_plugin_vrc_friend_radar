@@ -4,6 +4,7 @@ import uuid
 import asyncio
 import json
 import html
+import httpx
 from pathlib import Path
 import time
 import re
@@ -26,8 +27,10 @@ from PIL import Image as PILImage, ImageDraw, ImageFilter, ImageFont
 from .core.config import PluginConfig
 from .core.db import RadarDB
 from .core.monitor import MonitorService
+from .core.notifications import NotificationSyncService
 from .core.repository import SearchRepository, SettingsRepository
 from .core.search_state import SearchSession
+from .core.bilibili_parser import BilibiliParser, BilibiliParseError
 from .core.utils import extract_world_id, format_location, infer_joinability
 from .core.vrchat_client import VRChatClientError, VRChatNetworkError, VRChatTwoFactorRequiredError
 from .core.world_cache import WorldCache
@@ -86,6 +89,12 @@ class VRCFriendRadarPlugin(Star):
         self.monitor.set_event_callback(self._handle_monitor_events)
         self.monitor.set_loop_tick_callback(self._handle_loop_tick)
         self.monitor.set_notice_callback(self._handle_monitor_notice)
+        self.notification_sync = NotificationSyncService(
+            cfg=self.cfg,
+            db=self.db,
+            client_provider=lambda: self.monitor.client,
+        )
+        self.notification_sync.set_callback(self._handle_new_vrc_notifications)
         self._search_sessions: dict[str, SearchSession] = {}
         self._daily_task_last_sent_date: dict[str, str] = {"daily_report": ""}
         self._translation_lock_map: dict[str, asyncio.Lock] = {}
@@ -103,17 +112,47 @@ class VRCFriendRadarPlugin(Star):
         return html.escape(str(value or '').strip())
 
     def _get_card_font(self, size: int, *, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        font_candidates = []
+        # 1) 优先使用随插件捆绑的字体（推荐放 assets/fonts/NotoSansSC-Regular.otf 与 Bold）
+        bundled_root = self.cfg.plugin_dir / 'assets' / 'fonts'
+        bundled_candidates: list[Path] = []
+        if bold:
+            bundled_candidates.extend([
+                bundled_root / 'NotoSansSC-Bold.otf',
+                bundled_root / 'NotoSansCJKsc-Bold.otf',
+                bundled_root / 'SourceHanSansSC-Bold.otf',
+            ])
+        bundled_candidates.extend([
+            bundled_root / 'NotoSansSC-Regular.otf',
+            bundled_root / 'NotoSansCJKsc-Regular.otf',
+            bundled_root / 'SourceHanSansSC-Regular.otf',
+        ])
+        for candidate in bundled_candidates:
+            try:
+                if candidate.exists():
+                    return ImageFont.truetype(str(candidate), size)
+            except Exception:
+                continue
+
+        # 2) 退化到宿主系统常见中文字体（Windows / macOS / Linux 都各覆盖一份）
+        font_candidates: list[str] = []
         if bold:
             font_candidates.extend([
                 "msyhbd.ttc",
                 "simhei.ttf",
+                "PingFang.ttc",
+                "NotoSansCJK-Bold.ttc",
+                "NotoSansSC-Bold.otf",
+                "WenQuanYi Zen Hei.ttf",
                 "Arial-Bold.ttf",
                 "DejaVuSans-Bold.ttf",
             ])
         font_candidates.extend([
             "msyh.ttc",
             "simsun.ttc",
+            "PingFang.ttc",
+            "NotoSansCJK-Regular.ttc",
+            "NotoSansSC-Regular.otf",
+            "WenQuanYi Zen Hei.ttf",
             "Arial.ttf",
             "DejaVuSans.ttf",
         ])
@@ -683,6 +722,27 @@ class VRCFriendRadarPlugin(Star):
             return resolved.friend_id, resolved.display_name
         return await self._prompt_for_profile_target_choice(event, resolved.options, action_label)
 
+    @staticmethod
+    def _split_name_and_extras(raw: str) -> tuple[str, str]:
+        """把 `名字 [| 附加]` / `usr_xxx 附加` 分成 (名字或ID, 剩余参数字符串)。
+
+        规则：
+        - 包含管道符（| 或 ｜）→ 以第一个管道符为分隔
+        - 否则若首 token 是 usr_xxx → 首 token 为 ID，剩余为附加
+        - 否则：名字可能含空格，整段作为名字，附加为空（命令里若需要附加参数必须使用 `|`）
+        """
+        text = str(raw or '').strip()
+        if not text:
+            return '', ''
+        normalized = text.replace('｜', '|')
+        if '|' in normalized:
+            left, right = normalized.split('|', 1)
+            return left.strip(), right.strip()
+        parts = text.split(None, 1)
+        if parts and re.fullmatch(r'usr_[A-Za-z0-9_-]+', parts[0], flags=re.IGNORECASE):
+            return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else '')
+        return text, ''
+
     async def _resolve_two_profile_targets_interactive(
         self,
         event: AiocqhttpMessageEvent,
@@ -1176,6 +1236,8 @@ class VRCFriendRadarPlugin(Star):
         merged_notify_groups, merged_watch_friends = self._reconcile_dynamic_lists_on_startup()
         self._daily_task_last_sent_date["daily_report"] = self.settings_repo.get_daily_report_last_sent_date()
         asyncio.create_task(self.monitor.start())
+        asyncio.create_task(self.notification_sync.start())
+        self._register_llm_tools()
         logger.info(
             "[vrc_friend_radar] 插件后台初始化开始，已同步列表: notify_groups=%s, watch_friends=%s",
             len(merged_notify_groups),
@@ -1184,13 +1246,54 @@ class VRCFriendRadarPlugin(Star):
 
     async def terminate(self):
         await self.monitor.stop()
+        try:
+            await self.notification_sync.stop()
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 停止通知同步服务失败: {exc}")
         self._search_sessions.clear()
         self._translation_lock_map.clear()
         logger.info("[vrc_friend_radar] 插件已停止")
 
+    def _register_llm_tools(self) -> None:
+        """Register FunctionTool instances with AstrBot so the LLM agent can call them."""
+        try:
+            from .tools import build_llm_tools  # 延迟导入，避免在非插件加载场景触发
+            tools = build_llm_tools(self)
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 构建 LLM 工具失败，将跳过注册: {exc}")
+            return
+
+        add_method = getattr(self.context, 'add_llm_tools', None)
+        if callable(add_method):
+            try:
+                add_method(*tools)
+                logger.info(f"[vrc_friend_radar] 已注册 {len(tools)} 个 LLM FunctionTool")
+                return
+            except Exception as exc:
+                logger.warning(f"[vrc_friend_radar] context.add_llm_tools 注册失败，尝试兼容路径: {exc}")
+
+        # AstrBot < 4.5.1 的兼容路径
+        try:
+            tool_mgr = getattr(self.context, 'provider_manager', None)
+            llm_tools = getattr(tool_mgr, 'llm_tools', None) if tool_mgr else None
+            func_list = getattr(llm_tools, 'func_list', None) if llm_tools else None
+            if isinstance(func_list, list):
+                func_list.extend(tools)
+                logger.info(f"[vrc_friend_radar] 已通过兼容路径注册 {len(tools)} 个 LLM FunctionTool")
+                return
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] LLM 工具兼容路径注册失败: {exc}")
+
+        logger.warning("[vrc_friend_radar] 当前 AstrBot 版本可能不支持 FunctionTool 注册，已跳过。")
+
     async def _handle_monitor_events(self, events) -> None:
-        messages = await self._format_events_for_push(events)
-        await self._push_messages_to_notify_groups(messages)
+        # 先尝试针对关键词订阅和 tag 路由做分发
+        try:
+            await self._dispatch_signature_subscriptions(events)
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 签名关键词订阅分发失败: {exc}")
+
+        await self._dispatch_events_to_tag_routed_groups(events)
 
     async def _handle_monitor_notice(self, message: str) -> None:
         text = str(message or '').strip()
@@ -1304,6 +1407,103 @@ class VRCFriendRadarPlugin(Star):
             messages[: self.cfg.event_batch_size]
         )
         await self._send_chain_to_groups(MessageChain([Plain(merged)]))
+
+    async def _dispatch_events_to_tag_routed_groups(self, events) -> None:
+        """根据监控好友的 tag 把事件路由到指定群；其余事件走默认通知群。
+
+        群隐私开关：若群设置 hide_location=true，对该群的位置文本整体替换为「某个世界」，
+        避免泄漏具体实例。
+        """
+        if not events:
+            return
+        event_list = list(events[: self.cfg.event_batch_size])
+        default_groups = self.monitor.get_effective_notify_groups()
+
+        # 按目标群聚合事件
+        group_events: dict[str, list] = {}
+        for item in event_list:
+            # co_room 事件 friend_user_id 是 location_key，不好打 tag，落到默认群
+            target_groups = default_groups
+            if getattr(item, 'event_type', '') != 'co_room':
+                target_groups = self.monitor.resolve_event_target_groups(item.friend_user_id, default_groups)
+            for group_id in target_groups or []:
+                group_events.setdefault(str(group_id), []).append(item)
+
+        if not group_events:
+            return
+
+        hide_groups = self.monitor.get_hide_location_group_ids()
+        for group_id, items in group_events.items():
+            try:
+                messages = await self._format_events_for_push(items)
+            except Exception as exc:
+                logger.error(f"[vrc_friend_radar] 为群 {group_id} 构建事件消息失败: {exc}", exc_info=True)
+                continue
+            if group_id in hide_groups:
+                messages = [self._redact_location_detail(msg) for msg in messages]
+            merged = self.monitor.notifier.build_batch_message(messages[: self.cfg.event_batch_size])
+            if not merged:
+                continue
+            try:
+                await StarTools.send_message_by_id(
+                    type="GroupMessage",
+                    id=group_id,
+                    message_chain=MessageChain([Plain(merged)]),
+                    platform="aiocqhttp",
+                )
+            except Exception as exc:
+                logger.error(f"[vrc_friend_radar] 推送事件到群 {group_id} 失败: {exc}")
+
+    @staticmethod
+    def _redact_location_detail(text: str) -> str:
+        """粗粒度隐私脱敏：把具体世界/实例文字替换为「某个世界」。"""
+        if not text:
+            return text
+        redacted = re.sub(r'（[^）]*实例[^）]*）', '', text)
+        redacted = re.sub(r'位置：[^\n]+', '位置：某个世界', redacted)
+        redacted = re.sub(r'切换地图：[^\n]+', '切换地图：某个世界 → 某个世界', redacted)
+        return redacted
+
+    async def _dispatch_signature_subscriptions(self, events) -> None:
+        """当好友签名变化命中关键词订阅时，私聊订阅者。"""
+        subs = self.db.list_signature_subscriptions()
+        if not subs:
+            return
+        keyword_map: dict[str, list[str]] = {}
+        for keyword, subscriber_id in subs:
+            keyword_map.setdefault(keyword, []).append(subscriber_id)
+
+        for event in events or []:
+            if getattr(event, 'event_type', '') != 'status_message_changed':
+                continue
+            new_value = str(event.new_value or '')
+            if not new_value:
+                continue
+            shown_name = self._sanitize_display_name_for_output(event.display_name)
+            for keyword, subscribers in keyword_map.items():
+                if keyword and keyword in new_value:
+                    text = (
+                        f"🔔 签名关键词命中：{shown_name} 的 VRChat 状态签名包含「{keyword}」\n"
+                        f"新签名：{new_value}"
+                    )
+                    await self._send_chain_to_private_users(subscribers, MessageChain([Plain(text)]))
+
+    async def _handle_new_vrc_notifications(self, notifications: list[dict]) -> None:
+        """收到新的 VRChat 站内通知时，向管理员/通知群发送一条摘要提示。"""
+        if not notifications:
+            return
+        lines = ["📬 收到新的 VRChat 站内通知，可执行 /vrc通知中心 审批："]
+        for idx, item in enumerate(notifications[:5], start=1):
+            notif_type = item.get('type') or 'unknown'
+            sender = item.get('sender_username') or item.get('sender_user_id') or '未知'
+            message = item.get('message') or ''
+            lines.append(f"{idx}. [{notif_type}] 来自 {sender} | {message[:40]}")
+        text = "\n".join(lines)
+        admins = self._resolve_admin_notice_targets()
+        if admins:
+            await self._send_chain_to_private_users(admins, MessageChain([Plain(text)]))
+        else:
+            await self._send_chain_to_groups(MessageChain([Plain(text)]))
 
     def _build_session_key(self, event: AiocqhttpMessageEvent) -> str:
         sender_id = "unknown"
@@ -2072,24 +2272,44 @@ class VRCFriendRadarPlugin(Star):
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc添加监控")
     async def add_watch_friend(self, event: AiocqhttpMessageEvent):
-        friend_id = event.message_str.replace("vrc添加监控", "", 1).strip()
-        if not friend_id:
-            yield event.plain_result("用法：/vrc添加监控 usr_xxx")
+        raw = event.message_str.replace("vrc添加监控", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc添加监控 名字或usr_xxx [| tag1 tag2 ...]")
+            return
+        name_part, extras = self._split_name_and_extras(raw)
+        if not name_part:
+            yield event.plain_result("用法：/vrc添加监控 名字或usr_xxx [| tag1 tag2 ...]")
+            return
+        try:
+            friend_id, display_name = await self._resolve_profile_target_interactive(event, name_part, "添加监控")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"添加监控失败：{exc}")
             return
         self.settings_repo.add_watch_friend(friend_id)
         _, items = self._sync_runtime_config_lists_from_repo()
-        yield event.plain_result(f"已添加监控好友 {friend_id}，当前监控数量：{len(items)}")
+        tag_text = ''
+        tags = [t for t in re.split(r"[\s,，、]+", extras) if t] if extras else []
+        if tags:
+            cleaned = self.monitor.set_friend_tags(friend_id, tags)
+            if cleaned:
+                tag_text = f"，tag={'、'.join(cleaned)}"
+        yield event.plain_result(f"已添加监控好友 {display_name}（{friend_id}）{tag_text}，当前监控数量：{len(items)}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc删除监控")
     async def remove_watch_friend(self, event: AiocqhttpMessageEvent):
-        friend_id = event.message_str.replace("vrc删除监控", "", 1).strip()
-        if not friend_id:
-            yield event.plain_result("用法：/vrc删除监控 usr_xxx")
+        raw = event.message_str.replace("vrc删除监控", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc删除监控 名字或usr_xxx")
+            return
+        try:
+            friend_id, display_name = await self._resolve_profile_target_interactive(event, raw, "删除监控")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"删除监控失败：{exc}")
             return
         self.settings_repo.remove_watch_friend(friend_id)
         _, items = self._sync_runtime_config_lists_from_repo()
-        yield event.plain_result(f"已删除监控好友 {friend_id}，当前监控数量：{len(items)}")
+        yield event.plain_result(f"已删除监控好友 {display_name}（{friend_id}），当前监控数量：{len(items)}")
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("vrc监控列表")
@@ -2100,12 +2320,15 @@ class VRCFriendRadarPlugin(Star):
             return
 
         snapshot_map = self.db.get_friend_snapshot_map()
+        tag_map = self.monitor.get_all_friend_tags()
         lines: list[str] = []
         for idx, friend_id in enumerate(items, start=1):
             snapshot = snapshot_map.get(friend_id)
             display_name = self._sanitize_display_name_for_output(snapshot.display_name if snapshot else '')
             shown_name = display_name or friend_id
-            lines.append(f"{idx}. {shown_name}")
+            tags = tag_map.get(friend_id) or []
+            tag_text = f" | tag: {'、'.join(tags)}" if tags else ''
+            lines.append(f"{idx}. {shown_name}{tag_text}")
 
         yield event.plain_result("监控好友列表：\n" + "\n".join(lines))
 
@@ -2590,7 +2813,7 @@ class VRCFriendRadarPlugin(Star):
     async def public_friend_request(self, event: AiocqhttpMessageEvent):
         raw = event.message_str.replace("vrc\u52a0\u597d\u53cb", "", 1).strip()
         if not raw:
-            yield event.plain_result("\u7528\u6cd5\uff1a/vrc\u52a0\u597d\u53cb usr_xxx")
+            yield event.plain_result("\u7528\u6cd5\uff1a/vrc\u52a0\u597d\u53cb \u540d\u5b57\u6216 usr_xxx")
             return
         if not self._is_public_friend_request_allowed():
             yield event.plain_result("\u5f53\u524d\u7ba1\u7406\u5458\u8fd8\u6ca1\u6709\u5f00\u653e\u516c\u5171\u52a0\u597d\u53cb\u529f\u80fd\u3002")
@@ -2598,13 +2821,14 @@ class VRCFriendRadarPlugin(Star):
         if not self.monitor.client.is_logged_in():
             yield event.plain_result("\u673a\u5668\u4eba\u5f53\u524d\u8fd8\u6ca1\u6709\u767b\u5f55 VRChat \u8d26\u53f7\uff0c\u6682\u65f6\u65e0\u6cd5\u4ee3\u53d1\u597d\u53cb\u7533\u8bf7\u3002")
             return
-        target = raw.split()[0].strip()
-        if not re.fullmatch(r"usr_[A-Za-z0-9_-]+", target, flags=re.IGNORECASE):
-            yield event.plain_result("\u8bf7\u8f93\u5165\u6b63\u786e\u7684 VRChat \u7528\u6237 ID\uff0c\u4f8b\u5982 usr_xxx\u3002")
+        try:
+            target, display_name = await self._resolve_profile_target_interactive(event, raw, "\u53d1\u9001\u597d\u53cb\u7533\u8bf7")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"\u53d1\u9001\u597d\u53cb\u7533\u8bf7\u5931\u8d25\uff1a{exc}")
             return
         try:
             await self.monitor.client.send_friend_request(target)
-            yield event.plain_result(f"\u5df2\u7ecf\u5e2e\u4f60\u5411 {target} \u53d1\u51fa\u597d\u53cb\u7533\u8bf7\u5566\uff0c\u63a5\u4e0b\u6765\u5c31\u6e29\u67d4\u5730\u7b49\u5bf9\u65b9\u5728 VRChat \u91cc\u56de\u5e94\u5427\u3002")
+            yield event.plain_result(f"\u5df2\u7ecf\u5e2e\u4f60\u5411 {display_name}\uff08{target}\uff09\u53d1\u51fa\u597d\u53cb\u7533\u8bf7\u5566\uff0c\u63a5\u4e0b\u6765\u5c31\u6e29\u67d4\u5730\u7b49\u5bf9\u65b9\u5728 VRChat \u91cc\u56de\u5e94\u5427\u3002")
         except VRChatClientError as exc:
             yield event.plain_result(f"\u53d1\u9001\u597d\u53cb\u7533\u8bf7\u5931\u8d25\uff1a{exc}")
 
@@ -2631,3 +2855,1084 @@ class VRCFriendRadarPlugin(Star):
         for idx, item in enumerate(events, start=1):
             lines.append(f"{idx}. {item.event_type} | {item.friend_user_id} | {item.old_value or '空'} -> {item.new_value or '空'}")
         yield event.plain_result("\n".join(lines))
+
+    # -----------------------------------------------------------------
+    # 帮助菜单
+    # -----------------------------------------------------------------
+    @filter.command("vrc帮助")
+    async def help_menu(self, event: AiocqhttpMessageEvent):
+        sections = [
+            "VRChat 好友雷达命令速查：",
+            "【管理员】/vrc状态  /vrc测试  /vrc推送测试",
+            "【管理员】/vrc登录 用户名 密码  /vrc验证码 123456  /vrc解绑登录",
+            "【管理员】/vrc绑定通知群  /vrc解绑通知群  /vrc通知群",
+            "【管理员】/vrc添加监控 名字或usr_xxx [| tag1 tag2 ...]  /vrc删除监控 名字或usr_xxx  /vrc监控列表",
+            "【管理员】/vrc打标签 名字或usr_xxx | tag1 tag2 ...",
+            "【管理员】/vrc监控分组 tag 群号  /vrc分组解绑 tag  /vrc分组列表",
+            "【管理员】/vrc隐私 不显示位置/显示位置",
+            "【管理员】/vrc签名订阅 关键词  /vrc签名退订 关键词  /vrc签名订阅列表",
+            "【管理员】/vrc自适应轮询 开启|关闭",
+            "【管理员】/vrc通知中心  /vrc通知审批 编号 同意|拒绝",
+            "【管理员】/vrc接受邀请 编号  /vrc拒绝邀请 编号  /vrc邀请 名字或usr_xxx [| worldId:instanceId]",
+            "【管理员】/vrc同步好友  /vrc好友列表  /vrc在线好友  /vrc同房情况",
+            "【管理员】/vrc检测变化  /vrc最近事件  /vrc生成日报 [推送]  /vrc生成周报",
+            "【管理员】/vrc导出事件 [天数]  /vrc公共加好友 开启|关闭",
+            "【所有人】/vrc搜索好友 关键词 [页码]  /vrc搜索地图 关键词",
+            "【所有人】/vrc热门世界 [N]  /vrc加好友 名字",
+            "【所有人】/vrc戳 名字 | emojiId  /vrc资料 名字",
+            "【所有人】/vrc灵魂画像 名字  /vrc人设 名字  /命运指引 名字  /vrc缘分 名字",
+            "【所有人】/bili解析 BV号|av号|链接  /bili封面 BV号|链接",
+        ]
+        yield event.plain_result("\n".join(sections))
+
+    # -----------------------------------------------------------------
+    # 监控分组 tag
+    # -----------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc监控分组")
+    async def tag_bind_group(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc监控分组", "", 1).strip()
+        parts = raw.split()
+        if len(parts) < 2:
+            yield event.plain_result("用法：/vrc监控分组 tag 群号")
+            return
+        tag = parts[0].strip()
+        group_id = parts[1].strip()
+        if not tag or not group_id.isdigit():
+            yield event.plain_result("tag 不能为空，群号必须为数字。")
+            return
+        self.monitor.add_tag_group_route(tag, group_id)
+        routes = self.monitor.get_tag_group_routes()
+        yield event.plain_result(
+            f"已将 tag「{tag}」绑定到群 {group_id}，当前该 tag 的目标群：{'、'.join(routes.get(tag, []))}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc分组解绑")
+    async def tag_unbind_group(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc分组解绑", "", 1).strip()
+        parts = raw.split()
+        if not parts:
+            yield event.plain_result("用法：/vrc分组解绑 tag [群号]")
+            return
+        tag = parts[0].strip()
+        group_id = parts[1].strip() if len(parts) >= 2 else None
+        removed = self.monitor.remove_tag_group_route(tag, group_id)
+        if removed <= 0:
+            yield event.plain_result(f"未找到匹配的路由（tag={tag}, group={group_id or '任意'}）。")
+            return
+        yield event.plain_result(f"已解除 {removed} 条路由（tag={tag}, group={group_id or '全部'}）。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc分组列表")
+    async def tag_list(self, event: AiocqhttpMessageEvent):
+        routes = self.monitor.get_tag_group_routes()
+        tag_map = self.monitor.get_all_friend_tags()
+        if not routes and not tag_map:
+            yield event.plain_result("当前没有配置任何监控分组或好友 tag。")
+            return
+        lines: list[str] = []
+        if routes:
+            lines.append("分组→群 路由：")
+            for tag, group_ids in sorted(routes.items(), key=lambda x: x[0].casefold()):
+                lines.append(f"- {tag} → {'、'.join(group_ids) or '(无)'}")
+        if tag_map:
+            lines.append("")
+            lines.append("好友 tag 映射（仅展示已打 tag 的）：")
+            snapshot_map = self.db.get_friend_snapshot_map()
+            for friend_id, tags in sorted(tag_map.items()):
+                snapshot = snapshot_map.get(friend_id)
+                display = self._sanitize_display_name_for_output(snapshot.display_name) if snapshot else friend_id
+                lines.append(f"- {display}（{friend_id}）: {'、'.join(tags)}")
+        yield event.plain_result("\n".join(lines))
+
+    # -----------------------------------------------------------------
+    # 覆盖式扩展：给 /vrc添加监控 新增第二参 tag，不破坏旧用法
+    # -----------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc打标签")
+    async def tag_friend(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc打标签", "", 1).strip()
+        name_part, extras = self._split_name_and_extras(raw)
+        if not name_part or not extras:
+            yield event.plain_result("用法：/vrc打标签 名字或usr_xxx | tag1 tag2 ...")
+            return
+        try:
+            friend_id, display_name = await self._resolve_profile_target_interactive(event, name_part, "打标签")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"打标签失败：{exc}")
+            return
+        tags = [t for t in re.split(r"[\s,，、]+", extras) if t]
+        cleaned = self.monitor.set_friend_tags(friend_id, tags)
+        yield event.plain_result(f"已为 {display_name}（{friend_id}）打上 tag：{'、'.join(cleaned) if cleaned else '(无)'}")
+
+    # -----------------------------------------------------------------
+    # 群隐私
+    # -----------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc隐私")
+    async def toggle_group_privacy(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc隐私", "", 1).strip()
+        group_id = self._get_group_id(event)
+        if not group_id:
+            yield event.plain_result("该命令需要在目标群内执行。")
+            return
+        if raw in {"不显示位置", "隐藏位置", "hide"}:
+            self.monitor.set_group_privacy(group_id, True)
+            yield event.plain_result(f"已将群 {group_id} 设置为不显示位置（事件中的世界/实例会被脱敏）。")
+        elif raw in {"显示位置", "公开位置", "show"}:
+            self.monitor.set_group_privacy(group_id, False)
+            yield event.plain_result(f"已恢复群 {group_id} 的位置显示。")
+        else:
+            hide = group_id in self.monitor.get_hide_location_group_ids()
+            current = "不显示位置" if hide else "显示位置"
+            yield event.plain_result(f"当前群 {group_id} 隐私状态：{current}\n用法：/vrc隐私 不显示位置 | 显示位置")
+
+    # -----------------------------------------------------------------
+    # 签名关键词订阅
+    # -----------------------------------------------------------------
+    @filter.command("vrc签名订阅")
+    async def subscribe_signature_keyword(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc签名订阅", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc签名订阅 关键词")
+            return
+        sender_id = str(event.get_sender_id() or '').strip()
+        if not sender_id:
+            yield event.plain_result("无法识别发送者 ID，订阅失败。")
+            return
+        self.db.add_signature_subscription(raw, sender_id)
+        yield event.plain_result(f"已订阅签名关键词「{raw}」，命中时会私聊通知你。")
+
+    @filter.command("vrc签名退订")
+    async def unsubscribe_signature_keyword(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc签名退订", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc签名退订 关键词")
+            return
+        sender_id = str(event.get_sender_id() or '').strip()
+        removed = self.db.remove_signature_subscription(raw, sender_id)
+        if removed <= 0:
+            yield event.plain_result(f"未找到你对关键词「{raw}」的订阅。")
+            return
+        yield event.plain_result(f"已退订签名关键词「{raw}」。")
+
+    @filter.command("vrc签名订阅列表")
+    async def list_signature_subscriptions(self, event: AiocqhttpMessageEvent):
+        sender_id = str(event.get_sender_id() or '').strip()
+        items = self.db.list_signature_subscriptions(subscriber_id=sender_id)
+        if not items:
+            yield event.plain_result("你当前没有签名关键词订阅。可用：/vrc签名订阅 关键词")
+            return
+        lines = ["你当前的签名关键词订阅："]
+        for keyword, _sub in items:
+            lines.append(f"- {keyword}")
+        yield event.plain_result("\n".join(lines))
+
+    # -----------------------------------------------------------------
+    # 自适应轮询
+    # -----------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc自适应轮询")
+    async def toggle_adaptive_polling(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc自适应轮询", "", 1).strip()
+        if raw in {"开启", "on"}:
+            self.cfg.enable_adaptive_polling = True
+            if hasattr(self.cfg.raw_config, '__setitem__'):
+                try:
+                    self.cfg.raw_config['enable_adaptive_polling'] = True
+                    if hasattr(self.cfg.raw_config, 'save_config'):
+                        self.cfg.raw_config.save_config()
+                except Exception as exc:
+                    logger.warning(f"[vrc_friend_radar] 写回 enable_adaptive_polling 失败: {exc}")
+            yield event.plain_result(
+                f"已开启自适应轮询；范围 {self.cfg.adaptive_polling_min_seconds}-{self.cfg.adaptive_polling_max_seconds}s。"
+            )
+        elif raw in {"关闭", "off"}:
+            self.cfg.enable_adaptive_polling = False
+            if hasattr(self.cfg.raw_config, '__setitem__'):
+                try:
+                    self.cfg.raw_config['enable_adaptive_polling'] = False
+                    if hasattr(self.cfg.raw_config, 'save_config'):
+                        self.cfg.raw_config.save_config()
+                except Exception as exc:
+                    logger.warning(f"[vrc_friend_radar] 写回 enable_adaptive_polling 失败: {exc}")
+            yield event.plain_result(f"已关闭自适应轮询，恢复固定 {self.cfg.poll_interval_seconds}s 间隔。")
+        else:
+            status = "开启" if getattr(self.cfg, 'enable_adaptive_polling', False) else "关闭"
+            yield event.plain_result(
+                f"当前自适应轮询：{status}（范围 {self.cfg.adaptive_polling_min_seconds}-{self.cfg.adaptive_polling_max_seconds}s）\n"
+                "用法：/vrc自适应轮询 开启|关闭"
+            )
+
+    # -----------------------------------------------------------------
+    # 站内通知中心
+    # -----------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc通知中心")
+    async def notification_center(self, event: AiocqhttpMessageEvent):
+        # 先触发一次同步（不阻塞过久）
+        try:
+            await asyncio.wait_for(self.notification_sync.fetch_once(), timeout=8)
+        except asyncio.TimeoutError:
+            logger.warning("[vrc_friend_radar] 站内通知同步超时，使用本地缓存继续响应。")
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 站内通知主动同步失败: {exc}")
+
+        items = self.db.list_vrc_notifications(include_consumed=False, limit=20)
+        if not items:
+            yield event.plain_result("当前没有待处理的 VRChat 站内通知。")
+            return
+        lines = [f"待处理 VRChat 站内通知共 {len(items)} 条："]
+        for idx, item in enumerate(items, start=1):
+            sender = item.get('sender_username') or item.get('sender_user_id') or '未知'
+            notif_type = item.get('type') or 'unknown'
+            message = (item.get('message') or '').strip()
+            message_display = (message[:40] + '…') if len(message) > 40 else message
+            lines.append(f"{idx}. [{notif_type}] 来自 {sender} | {message_display or '(无留言)'}")
+        lines.append("")
+        lines.append("处理方式：")
+        lines.append("/vrc通知审批 编号 同意  /vrc通知审批 编号 拒绝")
+        lines.append("/vrc接受邀请 编号  /vrc拒绝邀请 编号")
+        yield event.plain_result("\n".join(lines))
+
+    def _pick_pending_notification(self, index_text: str) -> dict | None:
+        try:
+            idx = int(index_text)
+        except ValueError:
+            return None
+        items = self.db.list_vrc_notifications(include_consumed=False, limit=50)
+        if idx < 1 or idx > len(items):
+            return None
+        return items[idx - 1]
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc通知审批")
+    async def approve_notification(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc通知审批", "", 1).strip()
+        parts = raw.split()
+        if len(parts) < 2:
+            yield event.plain_result("用法：/vrc通知审批 编号 同意|拒绝")
+            return
+        item = self._pick_pending_notification(parts[0])
+        if item is None:
+            yield event.plain_result("未找到对应编号的通知，请先执行 /vrc通知中心 确认。")
+            return
+        decision = parts[1].strip()
+        if decision not in {"同意", "拒绝", "accept", "reject"}:
+            yield event.plain_result("第二个参数必须是 同意 或 拒绝。")
+            return
+        accept = decision in {"同意", "accept"}
+        try:
+            ok = await self.monitor.client.respond_friend_request(item['id'], accept)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"处理通知失败：{exc}")
+            return
+        if not ok:
+            yield event.plain_result("处理通知失败，可能 SDK 未适配，请稍后重试。")
+            return
+        self.db.mark_vrc_notification_consumed(item['id'])
+        yield event.plain_result(f"已{'同意' if accept else '拒绝'}该通知：{item.get('sender_username') or item.get('sender_user_id')}")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc接受邀请")
+    async def accept_invite(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc接受邀请", "", 1).strip()
+        item = self._pick_pending_notification(raw)
+        if item is None:
+            yield event.plain_result("未找到对应编号的邀请，请先执行 /vrc通知中心。")
+            return
+        # 邀请通知通常包含 details.worldId 或 details.instanceId
+        details = item.get('details') or {}
+        world_id = str(details.get('worldId') or '').strip()
+        instance_id = str(details.get('instanceId') or details.get('location') or '').strip()
+        if not world_id or not instance_id:
+            yield event.plain_result("该通知不包含可直接接受的实例信息，建议在 VRChat 客户端内处理。")
+            return
+        # 接受邀请在 VRChat API 中其实就是「删除通知」+「用户自行前往」；这里给出实例地址便于跳转
+        self.db.mark_vrc_notification_consumed(item['id'])
+        yield event.plain_result(
+            f"已标记邀请为已处理。建议前往：worldId={world_id}, instanceId={instance_id}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc拒绝邀请")
+    async def reject_invite(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc拒绝邀请", "", 1).strip()
+        item = self._pick_pending_notification(raw)
+        if item is None:
+            yield event.plain_result("未找到对应编号的邀请，请先执行 /vrc通知中心。")
+            return
+        try:
+            await self.monitor.client.mark_notification_seen(item['id'])
+        except VRChatClientError as exc:
+            logger.warning(f"[vrc_friend_radar] 标记邀请已读失败: {exc}")
+        self.db.mark_vrc_notification_consumed(item['id'])
+        yield event.plain_result("已拒绝该邀请并在本地标记为已处理。")
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc邀请")
+    async def invite_to_instance(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc邀请", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc邀请 名字或usr_xxx [| worldId:instanceId]")
+            return
+        name_part, instance_id = self._split_name_and_extras(raw)
+        if not name_part:
+            yield event.plain_result("用法：/vrc邀请 名字或usr_xxx [| worldId:instanceId]")
+            return
+        try:
+            target, display_name = await self._resolve_profile_target_interactive(event, name_part, "发送实例邀请")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"发送邀请失败：{exc}")
+            return
+
+        if not instance_id:
+            # 默认：邀请到机器人当前所在实例
+            try:
+                self_snapshot = await self.monitor.client.fetch_self_snapshot()
+            except Exception:
+                self_snapshot = None
+            instance_id = self_snapshot.location if self_snapshot else ''
+            if not instance_id:
+                yield event.plain_result("无法识别机器人当前实例，请显式传入：/vrc邀请 名字 | worldId:instanceId")
+                return
+        try:
+            ok = await self.monitor.client.invite_user_to_instance(target, instance_id)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"发送邀请失败：{exc}")
+            return
+        yield event.plain_result(f"已向 {display_name}（{target}）发送邀请，期待对方前来～" if ok else "邀请发送失败，请检查 VRChat 端状态。")
+
+    # -----------------------------------------------------------------
+    # /vrc戳  /vrc资料
+    # -----------------------------------------------------------------
+    @filter.command("vrc戳")
+    async def boop_friend(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc戳", "", 1).strip()
+        if not raw:
+            yield event.plain_result(
+                "用法：/vrc戳 名字或usr_xxx | emojiId\n"
+                "VRChat 的 Boop 只能携带一个 emoji，没有文字留言。\n"
+                "emojiId 可选：留空=纯戳（对方只收到'被戳'通知）；\n"
+                "   也可以填官方默认 emoji 的常量名（如 smile / skull / ghost），\n"
+                "   或上传后的自定义贴纸 FileID。"
+            )
+            return
+        name_part, emoji_id = self._split_name_and_extras(raw)
+        if not name_part:
+            yield event.plain_result("用法：/vrc戳 名字或usr_xxx | emojiId（emojiId 可留空）")
+            return
+        if not self.monitor.client.is_logged_in():
+            yield event.plain_result("当前未登录 VRChat，无法戳一戳。")
+            return
+        try:
+            target, display_name = await self._resolve_profile_target_interactive(event, name_part, "戳一戳")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"戳一戳失败：{exc}")
+            return
+        try:
+            await self.monitor.client.boop_user(target, emoji_id or None)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"戳一戳失败：{exc}")
+            return
+        if emoji_id:
+            suffix = f"，带上了 emoji：{emoji_id}"
+        else:
+            suffix = "（纯戳，没带 emoji）"
+        yield event.plain_result(f"已经戳了 {display_name}（{target}）一下{suffix}，说不定对方等会就回戳你～")
+
+    @filter.command("vrc资料")
+    async def user_profile(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc资料", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc资料 名字或usr_xxx")
+            return
+        if not self.monitor.client.is_logged_in():
+            yield event.plain_result("当前未登录 VRChat，无法拉取用户资料。")
+            return
+        try:
+            target, display_name = await self._resolve_profile_target_interactive(event, raw, "查看资料")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"查看资料失败：{exc}")
+            return
+        try:
+            info = await self.monitor.client.get_user_detail(target)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"查看资料失败：{exc}")
+            return
+        if not info:
+            yield event.plain_result(f"暂时无法获取 {display_name} 的公开资料。")
+            return
+
+        lines = [f"📇 {info.get('display_name') or display_name} 的 VRChat 资料"]
+        lines.append(f"用户 ID：{info.get('id') or target}")
+        if info.get('status'):
+            parts = [f"状态：{info['status']}"]
+            if info.get('status_description'):
+                parts.append(f"签名：{info['status_description']}")
+            lines.append(" | ".join(parts))
+        if info.get('location'):
+            world_text = await self._format_world_display(info['location'])
+            lines.append(f"当前位置：{world_text}")
+        if info.get('last_platform'):
+            lines.append(f"最近平台：{info['last_platform']}")
+        if info.get('last_login'):
+            lines.append(f"最近登录：{info['last_login']}")
+        if info.get('date_joined'):
+            lines.append(f"加入日期：{info['date_joined']}")
+        if info.get('is_friend'):
+            lines.append("与当前账号互为好友")
+        if info.get('bio'):
+            bio = info['bio'].strip()
+            if len(bio) > 180:
+                bio = bio[:180] + '…'
+            lines.append(f"简介：{bio}")
+        if info.get('bio_links'):
+            lines.append("外链：" + "、".join(info['bio_links'][:5]))
+        if info.get('tags'):
+            friendly_tags = [tag for tag in info['tags'] if not tag.startswith('system_')][:8]
+            if friendly_tags:
+                lines.append("标签：" + "、".join(friendly_tags))
+
+        components: list = [Plain("\n".join(lines))]
+        avatar_url = info.get('current_avatar_thumbnail_image_url') or info.get('current_avatar_image_url') or info.get('user_icon') or info.get('profile_pic_override')
+        if avatar_url:
+            local_img = await self._download_image_to_temp(avatar_url)
+            if local_img:
+                try:
+                    components.append(Image.fromFileSystem(local_img))
+                except Exception as exc:
+                    logger.warning(f"[vrc_friend_radar] 用户资料图片拼接失败: {exc}")
+        yield event.chain_result(components)
+
+    # -----------------------------------------------------------------
+    # 周报 / 事件导出
+    # -----------------------------------------------------------------
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc生成周报")
+    async def weekly_report(self, event: AiocqhttpMessageEvent):
+        now = datetime.now()
+        start_dt = now - timedelta(days=7)
+        start = start_dt.isoformat(timespec='seconds')
+        end = now.isoformat(timespec='seconds')
+        events_all = self.db.list_events_between(start, end, friend_ids=None, limit=50000)
+
+        watch_ids = set(self.monitor.get_monitor_watch_friend_ids())
+        scoped = []
+        for item in events_all:
+            if item.event_type == 'co_room':
+                member_ids = [fid for fid in (item.new_value or '').split('|') if fid]
+                if any(fid in watch_ids for fid in member_ids):
+                    scoped.append(item)
+            elif item.friend_user_id in watch_ids:
+                scoped.append(item)
+
+        if not scoped:
+            yield event.plain_result("最近 7 天没有足够的监控事件用于生成周报。")
+            return
+
+        type_counter = Counter(e.event_type for e in scoped)
+        unique_days = len({str(e.created_at)[:10] for e in scoped})
+        active_counter = Counter(
+            item.friend_user_id for item in scoped if item.event_type != 'co_room'
+        )
+        snapshot_map = self.db.get_friend_snapshot_map()
+
+        lines = [f"📊 VRChat 好友雷达周报 ({start_dt.strftime('%Y-%m-%d')} ~ {now.strftime('%Y-%m-%d')})"]
+        lines.append(
+            f"事件总量：{len(scoped)} 条（覆盖 {unique_days} 天）"
+            f" | 上线 {type_counter.get('friend_online', 0)}"
+            f" | 下线 {type_counter.get('friend_offline', 0)}"
+            f" | 切图 {type_counter.get('location_changed', 0)}"
+            f" | 同房 {type_counter.get('co_room', 0)}"
+        )
+        lines.append("")
+        lines.append(f"活跃监控好友 Top {min(5, len(active_counter))}：")
+        for idx, (friend_id, cnt) in enumerate(active_counter.most_common(5), start=1):
+            snapshot = snapshot_map.get(friend_id)
+            display = self._sanitize_display_name_for_output(snapshot.display_name) if snapshot else friend_id
+            lines.append(f"{idx}. {display} | 事件数 {cnt}")
+
+        hot_worlds_week: Counter = Counter()
+        for item in scoped:
+            if item.event_type == 'location_changed':
+                wid = extract_world_id(item.new_value)
+                if wid:
+                    hot_worlds_week[wid] += 1
+            elif item.event_type == 'co_room':
+                wid = extract_world_id(item.friend_user_id)
+                if wid:
+                    hot_worlds_week[wid] += 1
+        if hot_worlds_week:
+            lines.append("")
+            lines.append(f"本周热门世界 Top {min(5, len(hot_worlds_week))}：")
+            for idx, (world_id, cnt) in enumerate(hot_worlds_week.most_common(5), start=1):
+                name = await self._get_world_name(world_id) or world_id
+                lines.append(f"{idx}. {name} | 热度 {cnt}")
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc导出事件")
+    async def export_events(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc导出事件", "", 1).strip()
+        days = 7
+        if raw.isdigit():
+            days = max(1, min(30, int(raw)))
+        now = datetime.now()
+        start = (now - timedelta(days=days)).isoformat(timespec='seconds')
+        end = now.isoformat(timespec='seconds')
+        events_all = self.db.list_events_between(start, end, friend_ids=None, limit=50000)
+
+        export_dir = self.cfg.data_dir / 'exports'
+        export_dir.mkdir(parents=True, exist_ok=True)
+        filename = export_dir / f"events_{now.strftime('%Y%m%d_%H%M%S')}.csv"
+        import csv
+        try:
+            with filename.open('w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['created_at', 'event_type', 'friend_user_id', 'display_name', 'old_value', 'new_value'])
+                for item in events_all:
+                    writer.writerow([
+                        item.created_at,
+                        item.event_type,
+                        item.friend_user_id,
+                        item.display_name,
+                        item.old_value or '',
+                        item.new_value or '',
+                    ])
+        except Exception as exc:
+            yield event.plain_result(f"导出失败：{exc}")
+            return
+        yield event.plain_result(
+            f"已导出最近 {days} 天 {len(events_all)} 条事件至：{filename}"
+        )
+
+    # -----------------------------------------------------------------
+    # VRCX 启发的功能：备注 / 履历 / 改名历史 / 服务状态 / 实例 / 导出好友 / 热力图 / 全局搜好友
+    # -----------------------------------------------------------------
+
+    @filter.command("vrc备注")
+    async def friend_note_set(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc备注", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc备注 名字或usr_xxx | 备注文字（留空则清除备注）")
+            return
+        name_part, note_text = self._split_name_and_extras(raw)
+        if not name_part:
+            yield event.plain_result("用法：/vrc备注 名字或usr_xxx | 备注文字")
+            return
+        try:
+            friend_id, display_name = await self._resolve_profile_target_interactive(event, name_part, "写本地备注")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"写备注失败：{exc}")
+            return
+        self.db.set_friend_note(friend_id, note_text)
+        # 同步写到 VRChat 账号（失败不影响本地备注）
+        sync_hint = ''
+        if self.monitor.client.is_logged_in():
+            try:
+                resp = await self.monitor.client.update_user_note(friend_id, note_text)
+                if resp is not None:
+                    sync_hint = '，已同步到 VRChat 账号'
+            except VRChatClientError as exc:
+                logger.warning(f"[vrc_friend_radar] update_user_note 同步失败: {exc}")
+                sync_hint = '，VRChat 端同步失败（备注仍已在本地保存）'
+        if not note_text:
+            yield event.plain_result(f"已清除 {display_name} 的本地备注{sync_hint}。")
+        else:
+            yield event.plain_result(f"已为 {display_name} 写备注：{note_text}{sync_hint}")
+
+    @filter.command("vrc备注列表")
+    async def friend_note_list(self, event: AiocqhttpMessageEvent):
+        notes = self.db.list_friend_notes()
+        if not notes:
+            yield event.plain_result("当前没有任何好友备注。可用 /vrc备注 名字 | 备注文字 新增。")
+            return
+        snapshot_map = self.db.get_friend_snapshot_map()
+        lines = [f"共 {len(notes)} 条好友备注："]
+        for idx, (friend_id, note) in enumerate(sorted(notes.items(), key=lambda x: x[0]), start=1):
+            snap = snapshot_map.get(friend_id)
+            display = self._sanitize_display_name_for_output(snap.display_name) if snap else friend_id
+            lines.append(f"{idx}. {display}：{note}")
+            if idx >= 30:
+                lines.append(f"… 其余 {len(notes) - idx} 条未展示")
+                break
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("vrc履历")
+    async def friendship_history(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc履历", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc履历 名字或usr_xxx")
+            return
+        try:
+            friend_id, display_name = await self._resolve_profile_target_interactive(event, raw, "查看履历")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"查看履历失败：{exc}")
+            return
+        profile = self.db.get_friend_profile(friend_id)
+        history = self.db.list_friend_name_history(friend_id, limit=10)
+        note = self.db.get_friend_note(friend_id)
+        snapshot = self.db.get_friend_snapshot_map().get(friend_id)
+        tags = self.monitor.get_friend_tags(friend_id)
+
+        lines = [f"📜 {display_name}（{friend_id}）的履历"]
+        if profile and profile.get('first_seen_at'):
+            first_seen = profile['first_seen_at']
+            try:
+                first_dt = datetime.fromisoformat(first_seen)
+                days_known = max(0, (datetime.now() - first_dt).days)
+                lines.append(f"初次发现：{first_seen}（认识约 {days_known} 天）")
+            except Exception:
+                lines.append(f"初次发现：{first_seen}")
+        else:
+            lines.append("初次发现：暂无记录（还没有同步过）")
+
+        if tags:
+            lines.append(f"标签：{'、'.join(tags)}")
+        if note and note.get('note_text'):
+            lines.append(f"备注：{note['note_text']}")
+        if snapshot:
+            status = snapshot.status or 'unknown'
+            lines.append(f"当前状态：{status}")
+            if snapshot.location and (snapshot.status or '').strip().lower() != 'offline':
+                world_text = await self._format_world_display(snapshot.location)
+                lines.append(f"当前位置：{world_text}")
+
+        if history:
+            lines.append("")
+            lines.append("改名历史：")
+            for item in history:
+                old_name = item.get('old_display_name') or '(首次记录)'
+                new_name = item.get('new_display_name')
+                when = item.get('changed_at') or ''
+                lines.append(f"- {when}: {old_name} → {new_name}")
+        else:
+            lines.append("改名历史：暂无记录")
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc服务状态")
+    async def server_status(self, event: AiocqhttpMessageEvent):
+        if not self.monitor.client.is_logged_in():
+            yield event.plain_result("未登录 VRChat，无法查询服务状态。")
+            return
+        try:
+            status = await self.monitor.client.get_server_status()
+        except VRChatClientError as exc:
+            yield event.plain_result(f"查询服务状态失败：{exc}")
+            return
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 查询服务状态异常: {exc}")
+            yield event.plain_result(f"查询服务状态异常：{exc}")
+            return
+        lines = ["🩺 VRChat 服务状态"]
+        if status.get('server_time'):
+            lines.append(f"服务器时间：{status['server_time']}")
+        if status.get('online_count'):
+            lines.append(f"当前全平台在线：约 {status['online_count']} 人")
+        auto_recover = self.monitor.get_auto_recover_status()
+        if auto_recover:
+            lines.append(f"本插件会话：{auto_recover.get('last_result') or '未知'}")
+        errors = status.get('errors') or []
+        if errors:
+            lines.append("诊断信息：")
+            for item in errors[:5]:
+                lines.append(f"- {item}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("vrc实例")
+    async def instance_info(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc实例", "", 1).strip()
+        # 入参：可以是 location key (wrld_xxx:instance) / world URL / 名字 / 留空用我自己的位置
+        world_id = ''
+        instance_id = ''
+        if raw:
+            # worldId:instanceId 直给
+            if raw.startswith('wrld_'):
+                if ':' in raw:
+                    world_part, instance_part = raw.split(':', 1)
+                    world_id = world_part.strip()
+                    instance_id = instance_part.split('~', 1)[0].strip()
+                else:
+                    # 只有世界 ID 没有实例 ID，报错友好提示
+                    yield event.plain_result("缺少实例 ID，用法：/vrc实例 wrld_xxx:12345~public")
+                    return
+            else:
+                # 作为好友名解析，然后读他的 snapshot.location
+                try:
+                    friend_id, _display_name = await self._resolve_profile_target_interactive(event, raw, "查看实例")
+                except VRChatClientError as exc:
+                    yield event.plain_result(f"查看实例失败：{exc}")
+                    return
+                snap = self.db.get_friend_snapshot_map().get(friend_id)
+                if not snap or not snap.location:
+                    yield event.plain_result("该好友当前没有可查询的实例信息（可能不在任何世界中）。")
+                    return
+                from .core.utils import extract_world_id
+                world_id = extract_world_id(snap.location)
+                if snap.location and ':' in snap.location:
+                    instance_id = snap.location.split(':', 1)[1].split('~', 1)[0].strip()
+        else:
+            # 用机器人自己的位置
+            try:
+                self_snap = await self.monitor.client.fetch_self_snapshot()
+            except Exception:
+                self_snap = None
+            if not self_snap or not self_snap.location:
+                yield event.plain_result("当前机器人不在任何实例中，用法：/vrc实例 wrld_xxx:12345~public 或 /vrc实例 好友名")
+                return
+            from .core.utils import extract_world_id
+            world_id = extract_world_id(self_snap.location)
+            if self_snap.location and ':' in self_snap.location:
+                instance_id = self_snap.location.split(':', 1)[1].split('~', 1)[0].strip()
+
+        if not world_id or not instance_id:
+            yield event.plain_result("没有解析出有效的 worldId + instanceId。")
+            return
+
+        try:
+            info = await self.monitor.client.get_instance(world_id, instance_id)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"查实例失败：{exc}")
+            return
+        if not info:
+            yield event.plain_result("未能查到该实例（可能已经关闭或不存在）。")
+            return
+
+        world_name = await self._get_world_name(f"{world_id}:{instance_id}")
+        lines = [f"🏠 {world_name}"]
+        lines.append(f"实例 ID：{instance_id}")
+        capacity = info.get('capacity') or 0
+        n_users = info.get('n_users') or 0
+        if capacity:
+            lines.append(f"人数：{n_users}/{capacity}" + ("（已满）" if info.get('full') else ""))
+        else:
+            lines.append(f"人数：{n_users}")
+        if info.get('region'):
+            lines.append(f"区域：{info['region']}")
+        if info.get('access_type'):
+            lines.append(f"类型：{info['access_type']}")
+        if info.get('owner_id'):
+            lines.append(f"Owner：{info['owner_id']}")
+        if info.get('closed_at'):
+            lines.append(f"关闭时间：{info['closed_at']}")
+        yield event.plain_result("\n".join(lines))
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc导出好友")
+    async def export_friends(self, event: AiocqhttpMessageEvent):
+        snapshots = self.monitor.list_cached_friends(limit=5000, offset=0)
+        if not snapshots:
+            yield event.plain_result("当前没有缓存好友。先执行 /vrc同步好友 再试。")
+            return
+        profiles_map: dict[str, dict] = {}
+        for snap in snapshots:
+            profile = self.db.get_friend_profile(snap.friend_user_id)
+            if profile:
+                profiles_map[snap.friend_user_id] = profile
+        tag_map = self.monitor.get_all_friend_tags()
+        notes_map = self.db.list_friend_notes()
+
+        export_dir = self.cfg.data_dir / 'exports'
+        export_dir.mkdir(parents=True, exist_ok=True)
+        filename = export_dir / f"friends_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        import csv
+        try:
+            with filename.open('w', encoding='utf-8-sig', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'friend_user_id', 'display_name', 'status', 'location',
+                    'status_description', 'updated_at', 'first_seen_at',
+                    'tags', 'note',
+                ])
+                for snap in snapshots:
+                    profile = profiles_map.get(snap.friend_user_id) or {}
+                    writer.writerow([
+                        snap.friend_user_id,
+                        snap.display_name,
+                        snap.status or '',
+                        snap.location or '',
+                        snap.status_description or '',
+                        snap.updated_at or '',
+                        profile.get('first_seen_at') or '',
+                        '、'.join(tag_map.get(snap.friend_user_id, [])),
+                        notes_map.get(snap.friend_user_id, ''),
+                    ])
+        except Exception as exc:
+            yield event.plain_result(f"导出失败：{exc}")
+            return
+        yield event.plain_result(f"已导出 {len(snapshots)} 位好友到：{filename}")
+
+    @filter.command("vrc热力图")
+    async def activity_heatmap(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc热力图", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc热力图 名字或usr_xxx（展示最近 30 天上线热力）")
+            return
+        try:
+            friend_id, display_name = await self._resolve_profile_target_interactive(event, raw, "渲染活动热力图")
+        except VRChatClientError as exc:
+            yield event.plain_result(f"渲染热力图失败：{exc}")
+            return
+        try:
+            image_path = await self._render_activity_heatmap(friend_id, display_name)
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar] 渲染热力图异常: {exc}")
+            yield event.plain_result(f"渲染热力图异常：{exc}")
+            return
+        if not image_path:
+            yield event.plain_result(f"{display_name} 近 30 天没有足够的上线事件用于生成热力图。")
+            return
+        yield event.image_result(image_path)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("vrc全局搜好友")
+    async def global_search_users(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("vrc全局搜好友", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/vrc全局搜好友 关键词")
+            return
+        if not self.monitor.client.is_logged_in():
+            yield event.plain_result("当前未登录 VRChat，无法做站内全局搜索。")
+            return
+        try:
+            results = await self.monitor.client.search_users(raw, limit=10, offset=0)
+        except VRChatClientError as exc:
+            yield event.plain_result(f"全局搜索失败：{exc}")
+            return
+        if not results:
+            yield event.plain_result(f"没有搜索到与 \"{raw}\" 相关的用户。")
+            return
+        lines = [f"🔎 全局搜到 {len(results)} 位用户："]
+        for idx, item in enumerate(results, start=1):
+            name = item.get('display_name') or '(未命名)'
+            uid = item.get('id') or ''
+            status = item.get('status') or 'unknown'
+            lines.append(f"{idx}. {name} | {uid} | 状态 {status}")
+        lines.append("可用 /vrc资料 usr_xxx 查看更多信息，或 /vrc加好友 名字 发送好友请求。")
+        yield event.plain_result("\n".join(lines))
+
+    async def _render_activity_heatmap(self, friend_id: str, display_name: str) -> str | None:
+        """画一张 7x24 的活动热力图：近 30 天内该好友的上线事件分布。
+
+        仅使用已落库事件，不触发额外网络请求。
+        """
+        now = datetime.now()
+        start_dt = now - timedelta(days=30)
+        start = start_dt.isoformat(timespec='seconds')
+        end = now.isoformat(timespec='seconds')
+        events = self.db.list_events_for_friend_between(friend_id, start, end, limit=20000)
+        if not events:
+            return None
+
+        # 统计矩阵：weekday (0=Mon) × hour (0-23)
+        matrix = [[0 for _ in range(24)] for _ in range(7)]
+        total_events = 0
+        for item in events:
+            if item.event_type not in {'friend_online', 'location_changed'}:
+                continue
+            ts_text = str(item.created_at or '').strip()
+            try:
+                dt = datetime.fromisoformat(ts_text)
+            except Exception:
+                continue
+            matrix[dt.weekday()][dt.hour] += 1
+            total_events += 1
+        if total_events <= 0:
+            return None
+
+        max_count = max(max(row) for row in matrix) or 1
+        # 用插件内已导入的 PIL 绘制
+        cell_size = 32
+        margin_left = 90
+        margin_top = 80
+        margin_right = 40
+        margin_bottom = 60
+        width = margin_left + cell_size * 24 + margin_right
+        height = margin_top + cell_size * 7 + margin_bottom
+
+        canvas = PILImage.new('RGB', (width, height), (32, 24, 40))
+        draw = ImageDraw.Draw(canvas)
+        title_font = self._get_card_font(22, bold=True)
+        label_font = self._get_card_font(14)
+        small_font = self._get_card_font(12)
+
+        draw.text((margin_left, 18), f"{display_name} 近 30 天 VRChat 活动热力图", font=title_font, fill=(255, 235, 248))
+        draw.text((margin_left, 48), f"总样本 {total_events} 次上线/切图，单元格越亮代表活跃度越高", font=small_font, fill=(230, 210, 225))
+
+        weekdays = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+        for row in range(7):
+            y = margin_top + row * cell_size
+            draw.text((margin_left - 60, y + cell_size // 2 - 8), weekdays[row], font=label_font, fill=(230, 210, 225))
+
+        for hour in range(0, 24, 2):
+            x = margin_left + hour * cell_size
+            draw.text((x + 4, margin_top - 22), f"{hour:02d}", font=small_font, fill=(230, 210, 225))
+
+        for row in range(7):
+            for hour in range(24):
+                count = matrix[row][hour]
+                ratio = count / max_count if max_count else 0
+                # 粉紫渐变配色，和灵魂画像卡风格一致
+                r = int(80 + 175 * ratio)
+                g = int(40 + 80 * ratio)
+                b = int(90 + 130 * ratio)
+                box = (
+                    margin_left + hour * cell_size + 1,
+                    margin_top + row * cell_size + 1,
+                    margin_left + (hour + 1) * cell_size - 1,
+                    margin_top + (row + 1) * cell_size - 1,
+                )
+                draw.rectangle(box, fill=(r, g, b), outline=(60, 38, 58))
+                if count > 0:
+                    draw.text((box[0] + 6, box[1] + 6), str(count), font=small_font, fill=(255, 245, 250))
+
+        legend_y = height - margin_bottom + 24
+        draw.text((margin_left, legend_y), f"峰值：单小时 {max_count} 次", font=small_font, fill=(230, 210, 225))
+        return save_temp_img(canvas)
+
+    # -----------------------------------------------------------------
+    # B 站本地解析
+    # -----------------------------------------------------------------
+    def _get_bili_parser(self) -> BilibiliParser:
+        parser = getattr(self, '_bili_parser', None)
+        if parser is None:
+            cookie = ''
+            try:
+                cookie = str(self._read_config_value('bilibili_cookie', '')).strip()
+            except Exception:
+                cookie = ''
+            parser = BilibiliParser(cookie=cookie or None)
+            self._bili_parser = parser
+        return parser
+
+    def _read_config_value(self, key: str, default=None):
+        """从 AstrBotConfig 读取单个键，不存在则返回 default。插件级别容错。"""
+        cfg = self.cfg.raw_config
+        try:
+            if hasattr(cfg, 'get'):
+                return cfg.get(key, default)
+            return getattr(cfg, key, default)
+        except Exception:
+            return default
+
+    @filter.command("bili解析")
+    async def bili_parse_command(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("bili解析", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/bili解析 BV号 / av号 / 视频链接（支持 b23.tv 短链，末尾可带 ?p=分P）")
+            return
+        parser = self._get_bili_parser()
+        try:
+            result = await parser.parse(raw, quality=116)
+        except BilibiliParseError as exc:
+            yield event.plain_result(f"解析失败：{exc}")
+            return
+        except Exception as exc:
+            logger.exception(f"[vrc_friend_radar][bili] 解析异常: {exc}")
+            yield event.plain_result(f"解析异常：{exc}")
+            return
+
+        lines = [f"🎬 {result.title or result.bvid}"]
+        if result.total_pages > 1:
+            lines.append(f"分 P：第 {result.page}/{result.total_pages} P{' · ' + result.part_title if result.part_title else ''}")
+        elif result.part_title and result.part_title != result.title:
+            lines.append(f"分 P 名：{result.part_title}")
+        lines.append(f"BV：{result.bvid}" + (f" | AV：{result.aid}" if result.aid else ""))
+        lines.append(f"时长：{BilibiliParser.format_duration(result.duration_seconds)}"
+                     f" | 清晰度：{result.quality}"
+                     f"（可选 {', '.join(map(str, result.accept_quality)) or '未知'}）")
+        if result.size_bytes:
+            lines.append(f"文件大小：{BilibiliParser.format_size(result.size_bytes)}")
+        lines.append(f"格式：{result.format or '未知'}")
+        lines.append("直链（有效期有限，建议尽快使用）：")
+        lines.append(result.video_url)
+        if result.backup_urls:
+            lines.append("备用直链：")
+            for idx, url in enumerate(result.backup_urls[:3], start=1):
+                lines.append(f"{idx}. {url}")
+
+        components: list = [Plain("\n".join(lines))]
+        if result.cover:
+            local_cover = await self._download_generic_image_to_temp(result.cover)
+            if local_cover:
+                try:
+                    components.append(Image.fromFileSystem(local_cover))
+                except Exception as exc:
+                    logger.warning(f"[vrc_friend_radar][bili] 附加封面图失败: {exc}")
+        yield event.chain_result(components)
+
+    @filter.command("bili封面")
+    async def bili_cover_command(self, event: AiocqhttpMessageEvent):
+        raw = event.message_str.replace("bili封面", "", 1).strip()
+        if not raw:
+            yield event.plain_result("用法：/bili封面 BV号 / av号 / 视频链接")
+            return
+        parser = self._get_bili_parser()
+        try:
+            bvid, _page = await parser.extract_bvid_and_page(raw)
+        except BilibiliParseError as exc:
+            yield event.plain_result(f"解析失败：{exc}")
+            return
+
+        # 拿封面不需要走 playurl，只查 /x/web-interface/view
+        headers = {
+            'User-Agent': parser.user_agent,
+            'Referer': f'https://www.bilibili.com/video/{bvid}',
+        }
+        try:
+            async with httpx.AsyncClient(timeout=12, headers=headers, follow_redirects=True) as client:
+                resp = await client.get(f'https://api.bilibili.com/x/web-interface/view?bvid={bvid}')
+                payload = resp.json()
+        except Exception as exc:
+            yield event.plain_result(f"获取封面失败：{exc}")
+            return
+        if int(payload.get('code', 0)) != 0:
+            yield event.plain_result(f"获取封面失败：{payload.get('message') or payload.get('msg') or 'unknown'}")
+            return
+        data = payload.get('data') or {}
+        title = str(data.get('title') or bvid)
+        cover = str(data.get('pic') or '')
+        if not cover:
+            yield event.plain_result(f"未找到 {title} 的封面。")
+            return
+        components: list = [Plain(f"🖼️ {title}\nBV：{bvid}\n封面链接：{cover}")]
+        local_cover = await self._download_generic_image_to_temp(cover)
+        if local_cover:
+            try:
+                components.append(Image.fromFileSystem(local_cover))
+            except Exception as exc:
+                logger.warning(f"[vrc_friend_radar][bili] 附加封面图失败: {exc}")
+        yield event.chain_result(components)
+
+    async def _download_generic_image_to_temp(self, url: str) -> str | None:
+        """通用（不走 VRChat 认证）的图片下载，用于 B 站封面等。"""
+        if not url:
+            return None
+        suffix = '.jpg'
+        lowered = url.lower()
+        if '.png' in lowered:
+            suffix = '.png'
+        elif '.webp' in lowered:
+            suffix = '.webp'
+        temp_dir = Path(tempfile.gettempdir()) / 'vrc_friend_radar'
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = temp_dir / f"bili_cover_{uuid.uuid4().hex}{suffix}"
+        headers = {
+            'User-Agent': BilibiliParser.DEFAULT_USER_AGENT,
+            'Referer': 'https://www.bilibili.com',
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15, headers=headers, follow_redirects=True) as client:
+                resp = await client.get(url)
+                if resp.status_code != 200:
+                    return None
+                file_path.write_bytes(resp.content)
+            return str(file_path)
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar][bili] 下载封面失败: {exc}")
+            return None

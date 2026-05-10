@@ -188,13 +188,22 @@ class MonitorService:
         if not self.client.is_logged_in():
             return
         now_ts = time.time()
-        if (now_ts - self._last_health_check_at) < self._health_check_interval_seconds:
+        # 允许通过 cfg.low_frequency_health_check_seconds 降低健康检查间隔（使用轻量 verifyAuthToken）
+        interval = getattr(self.cfg, 'low_frequency_health_check_seconds', 0) or self._health_check_interval_seconds
+        interval = max(120, int(interval or self._health_check_interval_seconds))
+        if (now_ts - self._last_health_check_at) < interval:
             return
         self._last_health_check_at = now_ts
         check_start = time.monotonic()
-        logger.info('[vrc_friend_radar] 会话健康检查开始 interval=%ss', self._health_check_interval_seconds)
+        logger.info('[vrc_friend_radar] 会话健康检查开始 interval=%ss', interval)
         try:
-            ok = await self.client.probe_session_health()
+            # 优先使用轻量 verifyAuthToken；失败时 probe_session_health 作为降级路径
+            try:
+                ok = await self.client.probe_auth_token()
+            except Exception:
+                ok = False
+            if not ok:
+                ok = await self.client.probe_session_health()
             elapsed = time.monotonic() - check_start
             if ok:
                 logger.info('[vrc_friend_radar] 会话健康检查通过 elapsed=%.2fs', elapsed)
@@ -285,6 +294,84 @@ class MonitorService:
         """监控语义统一入口：监控名单 + 可选本人。"""
         # get_effective_watch_friends 已处理 watch_self 的可见性，这里仅做一次去重。
         return self._dedupe_clean_ids(self.get_effective_watch_friends())
+
+    # -----------------------------------------------------------------
+    # 自适应轮询
+    # -----------------------------------------------------------------
+    def _resolve_poll_interval_seconds(self) -> int:
+        """基于最近一轮监控好友在线数量动态调整轮询间隔。
+
+        在线人数越多 → 间隔越短（但不会低于 min）；在线为 0 → 接近 max。
+        当 enable_adaptive_polling 关闭时退化为静态 poll_interval_seconds。
+        """
+        static_interval = max(60, int(self.cfg.poll_interval_seconds or 180))
+        if not getattr(self.cfg, 'enable_adaptive_polling', False):
+            return static_interval
+        min_s = max(60, int(getattr(self.cfg, 'adaptive_polling_min_seconds', 120) or 120))
+        max_s = max(min_s, int(getattr(self.cfg, 'adaptive_polling_max_seconds', 600) or 600))
+
+        # 使用最近一轮 detect_changes 后本地快照的在线好友数作为信号
+        try:
+            online_count = 0
+            watch_set = set(self._dedupe_clean_ids(self.get_monitor_watch_friend_ids()))
+            if watch_set:
+                snapshot_map = self.db.get_friend_snapshot_map()
+                for friend_id in watch_set:
+                    snap = snapshot_map.get(friend_id)
+                    if snap and str(snap.status or '').strip().lower() not in ('', 'offline'):
+                        online_count += 1
+            # 插值：online=0 → max_s；online>=8 → min_s；中间线性插值
+            saturate_at = 8
+            clamped = max(0, min(saturate_at, online_count))
+            ratio = clamped / saturate_at
+            interval = int(max_s - (max_s - min_s) * ratio)
+            return max(min_s, min(max_s, interval))
+        except Exception as exc:
+            logger.warning(f"[vrc_friend_radar] 自适应轮询间隔计算失败，回退静态值: {exc}")
+            return static_interval
+
+    # -----------------------------------------------------------------
+    # 监控标签 / 分组路由 / 群隐私
+    # -----------------------------------------------------------------
+    def get_friend_tags(self, friend_user_id: str) -> list[str]:
+        return self.db.get_friend_tags(friend_user_id)
+
+    def set_friend_tags(self, friend_user_id: str, tags: list[str]) -> list[str]:
+        return self.db.set_friend_tags(friend_user_id, tags)
+
+    def get_all_friend_tags(self) -> dict[str, list[str]]:
+        return self.db.get_all_friend_tags()
+
+    def add_tag_group_route(self, tag: str, group_id: str) -> None:
+        self.db.add_tag_group_route(tag, group_id)
+
+    def remove_tag_group_route(self, tag: str, group_id: str | None = None) -> int:
+        return self.db.remove_tag_group_route(tag, group_id)
+
+    def get_tag_group_routes(self) -> dict[str, list[str]]:
+        return self.db.get_tag_group_routes()
+
+    def resolve_event_target_groups(self, friend_user_id: str, default_groups: list[str]) -> list[str]:
+        """若该好友被打了 tag，且对应 tag 有路由群，则只推给这些群；否则沿用默认通知群。"""
+        tags = self.db.get_friend_tags(friend_user_id)
+        if not tags:
+            return list(default_groups)
+        routes = self.db.get_tag_group_routes()
+        routed: list[str] = []
+        seen: set[str] = set()
+        for tag in tags:
+            for group_id in routes.get(tag, []):
+                if group_id and group_id not in seen:
+                    seen.add(group_id)
+                    routed.append(group_id)
+        # 找不到路由时回退默认
+        return routed or list(default_groups)
+
+    def get_hide_location_group_ids(self) -> set[str]:
+        return self.db.get_hide_location_group_ids()
+
+    def set_group_privacy(self, group_id: str, hide_location: bool) -> None:
+        self.db.set_group_privacy(group_id, hide_location)
 
     @staticmethod
     def _should_track_self_location_change(old_location: str | None, new_location: str | None) -> bool:
@@ -599,7 +686,7 @@ class MonitorService:
                 except Exception as exc:
                     logger.error(f"[vrc_friend_radar] 轮询Tick回调执行失败: {exc}", exc_info=True)
             try:
-                await asyncio.wait_for(self._stop_event.wait(), timeout=max(1, self.cfg.poll_interval_seconds))
+                await asyncio.wait_for(self._stop_event.wait(), timeout=max(1, self._resolve_poll_interval_seconds()))
                 break
             except asyncio.TimeoutError:
                 continue
@@ -660,6 +747,9 @@ class MonitorService:
             self._last_sync_count = len(snapshots)
 
             await self._safe_fetch_self_snapshot(stage='sync_friends_post_fetch', trigger_recover_if_auth_invalid=False)
+
+            # 对整张好友表做一遍 profile 维护：首次见面日期 + 改名记录
+            self._update_friend_profiles(snapshots, [])
 
             self._persist_session_if_cookie_changed()
             return snapshots
@@ -826,6 +916,8 @@ class MonitorService:
                 skipped_world_events,
             )
             self.db.insert_event_history(events)
+            # VRCX 风格的 Friendship History：初次见面日期 + 改名轨迹
+            self._update_friend_profiles(new_snapshots, events)
             self._last_sync_count = len(new_snapshots)
             self._last_detected_events = events
             self._persist_session_if_cookie_changed()
@@ -962,6 +1054,41 @@ class MonitorService:
         for key in stale_keys:
             self._last_coroom_notify_at.pop(key, None)
         return result
+
+    def _update_friend_profiles(self, snapshots: list[FriendSnapshot], events: list[RadarEvent]) -> None:
+        """VRCX 风格的 Friendship History 维护。
+
+        - 首次在快照里见到某好友 → 写入 friend_profiles.first_seen_at
+        - display_name 与 profile 里记录的不一致 → 写一条 friend_name_history 并刷新 last_display_name
+
+        注意：即使没有产生 display_name_changed 事件（例如是首次看到这个好友），
+        也要把 last_display_name 同步到 profile；同时对于已经产生的事件也要把它落到 name_history 里。
+        """
+        if not snapshots and not events:
+            return
+
+        # 先处理 events 里的 display_name_changed
+        for event in events or []:
+            if event.event_type != 'display_name_changed':
+                continue
+            self.db.record_display_name_change(
+                event.friend_user_id,
+                str(event.old_value or ''),
+                str(event.new_value or ''),
+            )
+
+        # 再对 snapshot 做兜底：首次见 + 当前名字刷新
+        for snapshot in snapshots:
+            fid = (snapshot.friend_user_id or '').strip()
+            if not fid:
+                continue
+            current_name = (snapshot.display_name or '').strip()
+            profile = self.db.ensure_friend_profile(fid, current_name)
+            stored_name = str(profile.get('last_display_name') or '').strip()
+            if current_name and stored_name != current_name:
+                # 第一次见 → stored 空 → 直接 record（old 写空字符串做起点）
+                # 后续改名会在 events 那边单独写，但这里兜底：可能 diff 路径没覆盖到
+                self.db.record_display_name_change(fid, stored_name, current_name)
 
     def _dedupe_events(self, events: list[RadarEvent]) -> list[RadarEvent]:
         lower_bound = (datetime.now() - timedelta(seconds=self.cfg.event_dedupe_window_seconds)).isoformat(timespec='seconds')

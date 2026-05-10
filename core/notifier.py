@@ -32,8 +32,15 @@ class Notifier:
             return f"🗺️ {name} 切换地图：{format_location(event.old_value)} → {format_location(event.new_value)} | {old_joinability} → {new_joinability}"
         if event.event_type == "status_message_changed":
             return f"✏️ {name} 状态签名变化：{event.old_value or '空'} → {event.new_value or '空'}"
+        if event.event_type == "display_name_changed":
+            old_name = self._sanitize_display_name(event.old_value)
+            new_name = self._sanitize_display_name(event.new_value)
+            return f"🪪 {old_name} 改名为 {new_name}"
         if event.event_type == "co_room":
-            joinability = infer_joinability(event.friend_user_id)
+            # co_room 事件中 friend_user_id 承载的是 location_key（worldId:instanceId~mode），
+            # 历史实现误传 display_name 或 friend_id，这里以 location_key 为准推断 joinability
+            location_key = event.friend_user_id
+            joinability = infer_joinability(location_key)
             return f"👥 同房提醒：{name} 正在同一实例 | {joinability}"
         return f"ℹ️ {name} 发生未知变化"
 

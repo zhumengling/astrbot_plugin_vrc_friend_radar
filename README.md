@@ -107,31 +107,54 @@ pyotp>=2.9.0
 
 - `/vrc状态`：查看运行状态摘要（含 Web/API 登录态 与 当前账号客户端在线态区分）
 - `/vrc测试`：插件在线测试
+- `/vrc帮助`：命令速查菜单
 - `/vrc推送测试`：向通知群发测试推送
 - `/vrc解绑登录`：清除本地持久化登录态
-- `/vrc绑定通知群`：在群聊中把当前群设为通知群
-- `/vrc解绑通知群`：在群聊中移除当前通知群
-- `/vrc通知群`：查看通知群列表
-- `/vrc添加监控 usr_xxx`：按好友 ID 添加监控
-- `/vrc删除监控 usr_xxx`：按好友 ID 删除监控
-- `/vrc监控列表`：查看监控列表
+- `/vrc绑定通知群` / `/vrc解绑通知群` / `/vrc通知群`
+- `/vrc添加监控 名字或usr_xxx [| tag1 tag2 ...]`
+- `/vrc删除监控 名字或usr_xxx` / `/vrc监控列表`
+- `/vrc打标签 名字或usr_xxx | tag1 tag2`
+- `/vrc监控分组 tag 群号` / `/vrc分组解绑 tag [群号]` / `/vrc分组列表`
+- `/vrc隐私 不显示位置 | 显示位置`（在目标群内执行）
+- `/vrc自适应轮询 开启|关闭`
+- `/vrc通知中心`：聚合展示 VRChat 站内通知
+- `/vrc通知审批 编号 同意|拒绝`
+- `/vrc接受邀请 编号` / `/vrc拒绝邀请 编号`
+- `/vrc邀请 名字或usr_xxx [| worldId:instanceId]`：让机器人向好友发实例邀请
 - `/vrc添加监控序号 N`：将最近一次“搜索好友”结果第 N 项加入监控
-- `/vrc登录 用户名 密码`：发起登录（群聊会被拒绝，要求私聊）
-- `/vrc验证码 123456`：提交 2FA 验证码（群聊会被拒绝，要求私聊）
-- `/vrc同步好友`：同步好友快照到本地缓存
-- `/vrc好友列表 [页码]`
-- `/vrc在线好友 [页码]`
-- `/vrc检测变化`：手动执行一次变化检测
-- `/vrc同房情况`：查看当前同房分组
-- `/vrc生成日报 [推送]`：生成日报；参数 `推送` 时推送到通知群
-- `/vrc最近事件`：查看最近事件
+- `/vrc登录 用户名 密码`（私聊） / `/vrc验证码 123456`（私聊）
+- `/vrc同步好友` / `/vrc好友列表 [页码]` / `/vrc在线好友 [页码]`
+- `/vrc检测变化` / `/vrc同房情况`
+- `/vrc生成日报 [推送]` / `/vrc生成周报`
+- `/vrc导出事件 [天数]`：最近 N 天事件导出为 CSV 到插件 data/exports/
+- `/vrc公共加好友 开启|关闭`
+- `/vrc最近事件`
 
-### 非管理员也可用
+### 所有人可用
 
 - `/vrc搜索地图 关键词`
 - `/vrc搜索好友 关键词 [页码]`
 - `/vrc热门世界 [N]`
-- `/vrc灵魂画像 关键词`
+- `/vrc加好友 名字或usr_xxx`（需管理员 `/vrc公共加好友 开启`）
+- `/vrc戳 名字或usr_xxx | emojiId`：对好友发起一次 boop 互动。**VRChat 的 Boop 只能携带一个 emoji，不支持文字留言**。`emojiId` 可省略（纯戳）；也可以填官方默认 emoji 的常量名（如 `smile` / `skull` / `ghost`）或上传后的自定义贴纸 FileID。
+- `/vrc资料 名字或usr_xxx`：查看用户公开资料与当前头像
+- `/vrc灵魂画像 名字` / `/vrc人设 名字` / `/命运指引 名字` / `/vrc缘分 名字`
+- `/vrc签名订阅 关键词` / `/vrc签名退订 关键词` / `/vrc签名订阅列表`
+
+### B 站本地解析
+
+- `/bili解析 BV号 | av号 | 链接`：两步法解析直链（pagelist → playurl，platform=html5），支持 b23.tv 短链与 `?p=分P`。
+- `/bili封面 BV号 | 链接`：返回视频封面原图。
+
+可选配置：`bilibili_cookie` 填入 SESSDATA 等 Cookie 后可解析更高清晰度。
+
+> 命令里所有"名字"都走本地好友缓存做近似匹配。直接写 `usr_xxx` 也兼容；匹配到多名近似好友时会让你回复序号选择（60 秒内有效）。
+
+### 自动功能
+
+- **自适应轮询**：启用后依据监控好友在线数量在 `adaptive_polling_min_seconds` 与 `adaptive_polling_max_seconds` 之间动态调速。
+- **站内通知同步**：`enable_notification_sync=true` 时按 `notification_sync_interval_seconds` 周期拉取 VRChat 通知，收到新好友请求/邀请会私聊管理员摘要提醒。
+- **LLM 工具**：插件会自动向 AstrBot 注册 5 个 FunctionTool（`vrc_friend_status` / `vrc_online_friends` / `vrc_search_world` / `vrc_hot_worlds_today` / `vrc_coroom_groups`），Agent 可直接调用。
 
 ---
 

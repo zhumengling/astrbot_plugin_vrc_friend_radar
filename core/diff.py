@@ -54,4 +54,19 @@ def diff_snapshot(old: FriendSnapshot, new: FriendSnapshot) -> list[RadarEvent]:
             )
         )
 
+    # display name 改变：VRCX 里是 Friendship History 的核心事件
+    old_name = (old.display_name or "").strip()
+    new_name = (new.display_name or "").strip()
+    if old_name and new_name and old_name != new_name:
+        events.append(
+            RadarEvent(
+                friend_user_id=new.friend_user_id,
+                display_name=new.display_name,
+                event_type="display_name_changed",
+                old_value=old.display_name,
+                new_value=new.display_name,
+                created_at=new.updated_at,
+            )
+        )
+
     return events

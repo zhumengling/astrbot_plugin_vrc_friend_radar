@@ -146,5 +146,47 @@
     "description": "\u7075\u9b42\u753b\u50cf\u7edf\u8ba1\u5929\u6570",
     "hint": "\u7528\u4e8e\u201c\u672c\u5468 VR \u7075\u9b42\u753b\u50cf\u201d\u7b49\u5a31\u4e50\u5206\u6790\u547d\u4ee4\u7684\u7edf\u8ba1\u7a97\u53e3\uff0c\u9ed8\u8ba4 7 \u5929\uff1b\u82e5\u5386\u53f2\u6570\u636e\u4e0d\u8db3\uff0c\u5219\u6309\u5df2\u6709\u91c7\u6837\u5929\u6570\u751f\u6210\u3002",
     "default": 7
+  },
+  "enable_notification_sync": {
+    "type": "bool",
+    "description": "启用 VRChat 站内通知同步",
+    "hint": "开启后插件会定期拉取好友请求/世界邀请并缓存，支持 /vrc通知中心 等命令进行 IM 端审批。",
+    "default": true
+  },
+  "notification_sync_interval_seconds": {
+    "type": "int",
+    "description": "站内通知同步间隔(秒)",
+    "hint": "建议不低于 120，单独与监控轮询独立调度。",
+    "default": 180
+  },
+  "enable_adaptive_polling": {
+    "type": "bool",
+    "description": "启用自适应轮询",
+    "hint": "依据最近一轮在线监控好友人数动态调整轮询间隔；关闭时使用 poll_interval_seconds 固定值。",
+    "default": false
+  },
+  "adaptive_polling_min_seconds": {
+    "type": "int",
+    "description": "自适应轮询最小间隔",
+    "hint": "自适应模式下，轮询最短 间隔秒数；不建议低于 60。",
+    "default": 120
+  },
+  "adaptive_polling_max_seconds": {
+    "type": "int",
+    "description": "自适应轮询最大间隔",
+    "hint": "自适应模式下，轮询最长 间隔秒数；在线好友为 0 时接近这个值。",
+    "default": 600
+  },
+  "low_frequency_health_check_seconds": {
+    "type": "int",
+    "description": "会话健康检查间隔(秒)",
+    "hint": "使用轻量 verifyAuthToken 检测会话是否失效，支持缩短到 600 秒而不增加风控风险。",
+    "default": 600
+  },
+  "bilibili_cookie": {
+    "type": "text",
+    "description": "B 站 Cookie（可选）",
+    "hint": "用于 /bili解析 命令。不填也能用（默认 html5 平台不强制登录），填上可解析更高清晰度（需至少包含 SESSDATA=...）。从浏览器 F12 -> Network -> 任一请求里复制完整 Cookie 串。",
+    "default": ""
   }
 }
