@@ -72,7 +72,7 @@ help: |
   B 站本地解析（所有人可用）：
   /bili解析 BV号 | av号 | 链接 - 返回视频直链（两步法 pagelist→playurl，platform=html5）
   /bili封面 BV号 | 链接 - 返回视频封面
-version: 0.2.2
+version: 0.2.3
 author: zhumengling
 repo: https://github.com/zhumengling/astrbot_plugin_vrc_friend_radar
 astrbot_version: ">=4.16,<5"
