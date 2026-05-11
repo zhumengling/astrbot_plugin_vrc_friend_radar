@@ -57,9 +57,15 @@ class MonitorService:
         self._last_seen_raw_notify_groups = self._dedupe_clean_ids(self.cfg.read_notify_group_ids_from_raw())
         self._last_seen_raw_watch_friends = self._dedupe_clean_ids(self.cfg.read_watch_friend_ids_from_raw())
         self._stop_event = asyncio.Event()
+        # 旧版滑动窗口节流（保留字段以兼容 get_auto_recover_status 的输出结构）
         self._auto_recover_window_seconds = 3600
         self._auto_recover_max_attempts = 3
         self._auto_recover_attempt_timestamps: list[float] = []
+        # 新版指数退避：1min → 3min → 5min → 放弃（由管理员手动 /vrc登录 恢复）
+        self._auto_recover_backoff_seconds: list[int] = [60, 180, 300]
+        self._auto_recover_failure_count: int = 0
+        self._next_auto_recover_allowed_at: float = 0.0
+        self._auto_recover_exhausted: bool = False
         self._last_auto_recover_time: float = 0.0
         self._last_auto_recover_result: str = '未触发'
         self._last_auto_recover_reason: str = ''
@@ -485,6 +491,9 @@ class MonitorService:
         last_time = ''
         if self._last_auto_recover_time > 0:
             last_time = datetime.fromtimestamp(self._last_auto_recover_time).isoformat(timespec='seconds')
+        next_allowed_text = ''
+        if self._next_auto_recover_allowed_at > time.time():
+            next_allowed_text = datetime.fromtimestamp(self._next_auto_recover_allowed_at).isoformat(timespec='seconds')
         return {
             'last_time': last_time,
             'last_result': self._last_auto_recover_result,
@@ -494,7 +503,48 @@ class MonitorService:
             'attempts_in_window': len(self._auto_recover_attempt_timestamps),
             'window_seconds': self._auto_recover_window_seconds,
             'max_attempts': self._auto_recover_max_attempts,
+            # 新版指数退避状态
+            'failure_count': self._auto_recover_failure_count,
+            'backoff_seconds': list(self._auto_recover_backoff_seconds),
+            'next_allowed_at': next_allowed_text,
+            'exhausted': self._auto_recover_exhausted,
         }
+
+    def _record_auto_recover_success(self) -> None:
+        """自动恢复成功：清零失败计数和下一次允许时间。"""
+        self._auto_recover_failure_count = 0
+        self._next_auto_recover_allowed_at = 0.0
+        self._auto_recover_exhausted = False
+
+    def _record_auto_recover_failure(self, reason: str) -> None:
+        """自动恢复失败：按退避表推进计数。
+
+        失败次数 1 → 等 60s 才能再试
+        失败次数 2 → 等 180s
+        失败次数 3 → 等 300s
+        失败次数 4+ → 永久停止，等管理员手动 /vrc登录
+        """
+        self._auto_recover_failure_count += 1
+        now_ts = time.time()
+        if self._auto_recover_failure_count > len(self._auto_recover_backoff_seconds):
+            self._auto_recover_exhausted = True
+            self._next_auto_recover_allowed_at = float('inf')
+            logger.warning(
+                '[vrc_friend_radar] 自动恢复已连续失败 %s 次（超过退避序列 %s），停止自动重登，等待管理员手动 /vrc登录。reason=%s',
+                self._auto_recover_failure_count,
+                self._auto_recover_backoff_seconds,
+                reason,
+            )
+        else:
+            wait = self._auto_recover_backoff_seconds[self._auto_recover_failure_count - 1]
+            self._next_auto_recover_allowed_at = now_ts + wait
+            logger.warning(
+                '[vrc_friend_radar] 自动恢复失败第 %s 次，下一次允许时间推迟 %ss (=%s)。reason=%s',
+                self._auto_recover_failure_count,
+                wait,
+                datetime.fromtimestamp(self._next_auto_recover_allowed_at).isoformat(timespec='seconds'),
+                reason,
+            )
 
     async def auto_recover_login(self, trigger_reason: str, trigger_exc: Exception | None = None, source: str = 'unknown') -> bool:
         async with self._auto_recover_lock:
@@ -509,20 +559,45 @@ class MonitorService:
                 return False
 
             now_ts = time.time()
-            self._prune_auto_recover_attempts(now_ts)
-            if len(self._auto_recover_attempt_timestamps) >= self._auto_recover_max_attempts:
-                self._mark_auto_recover_result('节流跳过', f'{self._auto_recover_window_seconds // 60}分钟内自动恢复次数已达上限({self._auto_recover_max_attempts})')
-                logger.warning('[vrc_friend_radar] 自动恢复触发节流，已跳过本轮。reason=%s, attempts=%s/%s', reason_text, len(self._auto_recover_attempt_timestamps), self._auto_recover_max_attempts)
-                await self._emit_notice(
-                    f"[VRC雷达] 登录状态恢复触发节流：{self._auto_recover_window_seconds // 60} 分钟内已尝试 {self._auto_recover_max_attempts} 次。\n"
-                    f"触发原因：{reason_text}\n"
-                    "请稍后重试，或管理员手动执行 /vrc登录。"
+
+            # ---- 指数退避：连续失败达上限后永久停止，直到管理员手动 /vrc登录 ----
+            if self._auto_recover_exhausted:
+                self._mark_auto_recover_result(
+                    '已停止',
+                    f'连续失败 {self._auto_recover_failure_count} 次（超过退避序列），仅管理员 /vrc登录 可以恢复',
+                )
+                logger.warning(
+                    '[vrc_friend_radar] 自动恢复已停止：连续失败 %s 次。reason=%s',
+                    self._auto_recover_failure_count,
+                    reason_text,
                 )
                 return False
 
+            # ---- 指数退避：还没到下一次允许尝试的时间点 ----
+            if self._next_auto_recover_allowed_at > now_ts:
+                remaining = int(self._next_auto_recover_allowed_at - now_ts)
+                self._mark_auto_recover_result(
+                    '退避中',
+                    f'距离下一次尝试还有 {remaining}s（已失败 {self._auto_recover_failure_count} 次）',
+                )
+                logger.info(
+                    '[vrc_friend_radar] 自动恢复退避中 remaining=%ss failure_count=%s reason=%s',
+                    remaining,
+                    self._auto_recover_failure_count,
+                    reason_text,
+                )
+                return False
+
+            # 兼容旧版滑动窗口统计（仅用于 /vrc状态 展示）
+            self._prune_auto_recover_attempts(now_ts)
             self._auto_recover_attempt_timestamps.append(now_ts)
+
             self._mark_auto_recover_result('进行中', reason_text)
-            logger.warning('[vrc_friend_radar] 检测到认证失效，开始自动恢复登录。reason=%s, attempt=%s/%s', reason_text, len(self._auto_recover_attempt_timestamps), self._auto_recover_max_attempts)
+            logger.warning(
+                '[vrc_friend_radar] 检测到认证失效，开始自动恢复登录。reason=%s, failure_count(before)=%s',
+                reason_text,
+                self._auto_recover_failure_count,
+            )
             logger.info('[vrc_friend_radar] 自动恢复步骤 stage=discover_invalid_session source=%s category=%s', source, category)
 
             stored = self.session_store.load() or {}
@@ -539,9 +614,9 @@ class MonitorService:
                     self._post_login_cooldown_until = time.time() + 60
                     self._last_health_check_at = time.time()
                     self._reset_auto_recover_2fa_waiting()
+                    self._record_auto_recover_success()
                     self._mark_auto_recover_result('成功(restore_session)', '已通过持久化session恢复')
                     logger.info('[vrc_friend_radar] 自动恢复步骤 stage=restore_session success')
-                    logger.info('[vrc_friend_radar] 自动恢复成功：restore_session')
                     await self._emit_notice('[VRC雷达] VRChat 登录状态已自动恢复（restore_session）。')
                     return True
                 except VRChatClientError as exc:
@@ -556,7 +631,6 @@ class MonitorService:
             password = (password or '')
             if not username or not password:
                 username = stored_username
-                # 安全修复后不再从 session.json 回读明文密码，仅允许使用当前进程内已保存凭据
 
             # 关键增强：不要沿用可能污染的旧client/cookie，先清理会话再重建登录
             logger.info('[vrc_friend_radar] 自动恢复步骤 stage=recreate_client start')
@@ -564,9 +638,14 @@ class MonitorService:
             logger.info('[vrc_friend_radar] 自动恢复步骤 stage=recreate_client success')
 
             if not username or not password:
-                self._mark_auto_recover_result('失败', '无进程内账号密码，无法自动重登（安全策略不持久化本地密码）')
-                logger.error('[vrc_friend_radar] 自动恢复失败：无进程内账号密码（session.json 不再持久化密码）')
-                await self._emit_notice('[VRC雷达] VRChat 登录状态恢复失败：当前无可用进程内账号密码（安全策略已禁用本地明文密码持久化），无法自动重登。\n请管理员私聊执行 /vrc登录。')
+                reason = '无进程内账号密码，无法自动重登（安全策略不持久化本地密码）'
+                self._record_auto_recover_failure(reason)
+                self._mark_auto_recover_result('失败', reason)
+                logger.error('[vrc_friend_radar] 自动恢复失败：%s', reason)
+                await self._emit_notice(
+                    '[VRC雷达] VRChat 登录状态恢复失败：当前无可用进程内账号密码（安全策略已禁用本地明文密码持久化），无法自动重登。\n'
+                    '请管理员私聊执行 /vrc登录。'
+                )
                 return False
 
             try:
@@ -577,33 +656,40 @@ class MonitorService:
                 self._post_login_cooldown_until = time.time() + 60
                 self._last_health_check_at = time.time()
                 self._reset_auto_recover_2fa_waiting()
+                self._record_auto_recover_success()
                 self._mark_auto_recover_result('成功(relogin)', '已执行清旧会话后账号密码重登')
                 logger.info('[vrc_friend_radar] 自动恢复步骤 stage=relogin success')
-                logger.info('[vrc_friend_radar] 自动恢复成功：清旧会话后账号密码重登成功')
                 await self._emit_notice('[VRC雷达] VRChat 登录状态已自动恢复（清旧会话后重登成功）。')
                 return True
             except VRChatTwoFactorRequiredError as exc:
+                # 2FA 属于"需要管理员介入"，不算一次失败，也不推进退避。
                 self.create_pending_login(session_key='__auto_recover__', username=username, password=password, method=exc.method)
                 self._is_waiting_2fa_for_auto_recover = True
                 self._auto_recover_pending_method = exc.method
                 self._mark_auto_recover_result('等待2FA', f'自动恢复重登需要2FA: {exc.method}')
                 logger.warning('[vrc_friend_radar] 自动恢复步骤 stage=relogin wait_2fa method=%s', exc.method)
-                logger.warning('[vrc_friend_radar] 自动恢复重登需要2FA，已进入待验证码状态。method=%s', exc.method)
                 await self._emit_notice(
                     f"[VRC雷达] 自动恢复登录需要二步验证（{exc.method}）。\n"
                     "请管理员私聊机器人发送：/vrc验证码 123456"
                 )
                 return False
             except VRChatClientError as exc:
-                self._mark_auto_recover_result('失败', str(exc))
                 fail_category, fail_detail = self._classify_failure_reason(exc)
                 self._record_disconnect_reason(fail_category, fail_detail, source='auto_recover_relogin_failed')
+                self._record_auto_recover_failure(str(exc))
+                self._mark_auto_recover_result('失败', str(exc))
                 logger.error('[vrc_friend_radar] 自动恢复步骤 stage=relogin failed category=%s detail=%s', fail_category, fail_detail)
-                logger.error('[vrc_friend_radar] 自动恢复重登失败: %s', exc)
-                if isinstance(exc, VRChatNetworkError):
-                    await self._emit_notice(f"[VRC雷达] 自动恢复登录失败：网络异常。\n详细：{exc}\n请稍后重试或检查网络连通性。")
+
+                # 给用户报告本次失败后会等多久再试
+                if self._auto_recover_exhausted:
+                    tail = '已连续失败多次，插件将停止自动重登，请管理员私聊执行 /vrc登录。'
                 else:
-                    await self._emit_notice(f"[VRC雷达] 自动恢复登录失败：{exc}\n请管理员私聊执行 /vrc登录。")
+                    wait = self._auto_recover_backoff_seconds[self._auto_recover_failure_count - 1]
+                    tail = f'将在约 {wait // 60} 分钟后再尝试一次（指数退避）。'
+                if isinstance(exc, VRChatNetworkError):
+                    await self._emit_notice(f"[VRC雷达] 自动恢复登录失败：网络异常。\n详细：{exc}\n{tail}")
+                else:
+                    await self._emit_notice(f"[VRC雷达] 自动恢复登录失败：{exc}\n{tail}")
                 return False
 
 
@@ -770,7 +856,9 @@ class MonitorService:
             self._post_login_cooldown_until = time.time() + 60
             self._last_health_check_at = time.time()
             self._reset_auto_recover_2fa_waiting()
-            logger.info('[vrc_friend_radar] 登录成功，已设置 60 秒冷却期及健康检查计时重置')
+            # 管理员手动 /vrc登录 成功 → 重置指数退避状态，恢复自动重登
+            self._record_auto_recover_success()
+            logger.info('[vrc_friend_radar] 登录成功，已设置 60 秒冷却期、健康检查计时重置、指数退避清零')
             return result
         except Exception:
             if not adopted_client:
@@ -1316,6 +1404,12 @@ class MonitorService:
         auto_recover_attempts = auto_recover.get('attempts_in_window', 0)
         auto_recover_max = auto_recover.get('max_attempts', self._auto_recover_max_attempts)
         auto_recover_window = auto_recover.get('window_seconds', self._auto_recover_window_seconds)
+        # 指数退避状态展示
+        backoff_failure_count = auto_recover.get('failure_count', 0)
+        backoff_seq = auto_recover.get('backoff_seconds', [])
+        backoff_next_allowed = auto_recover.get('next_allowed_at') or '立即可尝试'
+        backoff_exhausted = '是（已停止，需手动 /vrc登录）' if auto_recover.get('exhausted') else '否'
+        backoff_seq_text = '/'.join(f'{s}s' for s in backoff_seq) if backoff_seq else '无'
         last_disconnect_time = datetime.fromtimestamp(self._last_disconnect_at).isoformat(timespec='seconds') if self._last_disconnect_at > 0 else '无'
         last_disconnect_category = self._last_disconnect_reason_category or '无'
         last_disconnect_detail = self._last_disconnect_reason_detail or '无'
@@ -1335,6 +1429,7 @@ class MonitorService:
             f"自动恢复失败/触发原因: {auto_recover_reason}\n"
             f"自动恢复待2FA: {auto_recover_waiting_2fa} ({auto_recover_waiting_method})\n"
             f"自动恢复尝试计数: {auto_recover_attempts}/{auto_recover_max} ({auto_recover_window}秒窗口)\n"
+            f"自动恢复退避: 失败{backoff_failure_count}次/序列{backoff_seq_text} 下一次允许={backoff_next_allowed} 已停止={backoff_exhausted}\n"
             f"最近掉线时间: {last_disconnect_time}\n"
             f"最近掉线分类: {last_disconnect_category}\n"
             f"最近掉线详情: {last_disconnect_detail}\n"
