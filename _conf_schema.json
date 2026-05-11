@@ -156,8 +156,8 @@
   "notification_sync_interval_seconds": {
     "type": "int",
     "description": "站内通知同步间隔(秒)",
-    "hint": "建议不低于 120，单独与监控轮询独立调度。",
-    "default": 180
+    "hint": "建议不低于 300，与监控轮询独立调度。过低会增加 VRChat API 请求频率导致被限流。",
+    "default": 600
   },
   "enable_adaptive_polling": {
     "type": "bool",
@@ -168,8 +168,8 @@
   "adaptive_polling_min_seconds": {
     "type": "int",
     "description": "自适应轮询最小间隔",
-    "hint": "自适应模式下，轮询最短 间隔秒数；不建议低于 60。",
-    "default": 120
+    "hint": "自适应模式下，轮询最短间隔秒数；不建议低于 180（VRChat 官方建议每 60 秒不超过 1 次请求，但 friends 接口需要 2 次调用）。",
+    "default": 180
   },
   "adaptive_polling_max_seconds": {
     "type": "int",
@@ -180,8 +180,8 @@
   "low_frequency_health_check_seconds": {
     "type": "int",
     "description": "会话健康检查间隔(秒)",
-    "hint": "使用轻量 verifyAuthToken 检测会话是否失效，支持缩短到 600 秒而不增加风控风险。",
-    "default": 600
+    "hint": "使用轻量 verifyAuthToken 检测会话是否失效。默认 1800 秒（30 分钟）。设太低会增加请求频率导致被限流。",
+    "default": 1800
   },
   "bilibili_cookie": {
     "type": "text",

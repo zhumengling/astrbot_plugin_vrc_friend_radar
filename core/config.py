@@ -41,11 +41,11 @@ class PluginConfig:
     allow_public_friend_request: bool = False
     soul_profile_days: int = 7
     enable_notification_sync: bool = True
-    notification_sync_interval_seconds: int = 180
+    notification_sync_interval_seconds: int = 600
     enable_adaptive_polling: bool = False
-    adaptive_polling_min_seconds: int = 120
+    adaptive_polling_min_seconds: int = 180
     adaptive_polling_max_seconds: int = 600
-    low_frequency_health_check_seconds: int = 600
+    low_frequency_health_check_seconds: int = 1800
 
     def __init__(self, raw_config: Any, context: Any):
         self.raw_config = raw_config
@@ -97,14 +97,14 @@ class PluginConfig:
         self.allow_public_friend_request = self._read_bool("allow_public_friend_request", False)
         self.soul_profile_days = max(1, min(30, self._read_int("soul_profile_days", 7)))
         self.enable_notification_sync = self._read_bool("enable_notification_sync", True)
-        self.notification_sync_interval_seconds = max(60, self._read_int("notification_sync_interval_seconds", 180))
+        self.notification_sync_interval_seconds = max(300, self._read_int("notification_sync_interval_seconds", 600))
         self.enable_adaptive_polling = self._read_bool("enable_adaptive_polling", False)
-        self.adaptive_polling_min_seconds = max(60, self._read_int("adaptive_polling_min_seconds", 120))
+        self.adaptive_polling_min_seconds = max(180, self._read_int("adaptive_polling_min_seconds", 180))
         self.adaptive_polling_max_seconds = max(
             self.adaptive_polling_min_seconds,
             self._read_int("adaptive_polling_max_seconds", 600),
         )
-        self.low_frequency_health_check_seconds = max(120, self._read_int("low_frequency_health_check_seconds", 600))
+        self.low_frequency_health_check_seconds = max(600, self._read_int("low_frequency_health_check_seconds", 1800))
 
     def _has_key(self, key: str) -> bool:
         cfg = self.raw_config

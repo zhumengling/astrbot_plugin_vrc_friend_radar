@@ -69,6 +69,8 @@ class MonitorService:
         self._health_check_interval_seconds = 1800
         self._last_session_persist_at: float = 0.0
         self._last_health_check_at: float = 0.0
+        self._last_notification_sync_at: float = 0.0
+        self._notification_sync_callback: Callable[[list[dict]], Awaitable[None]] | None = None
         self._last_persisted_cookie: str = ''
         self._auto_recover_lock = asyncio.Lock()
         self._poll_lock = asyncio.Lock()
@@ -217,6 +219,40 @@ class MonitorService:
                 recovered = await self.auto_recover_login(f'低频健康检查发现认证失效: {detail}', trigger_exc=exc, source='health_check')
                 if recovered:
                     logger.info('[vrc_friend_radar] 低频健康检查触发自动恢复成功')
+
+    def set_notification_sync_callback(self, callback: Callable[[list[dict]], Awaitable[None]] | None) -> None:
+        """设置通知同步回调。当拉到新通知时调用。"""
+        self._notification_sync_callback = callback
+
+    async def _try_periodic_notification_sync(self) -> None:
+        """在主循环内按独立计时器拉取 VRChat 站内通知。
+
+        与 detect_changes 串行执行，不会并发打 API。
+        """
+        if not getattr(self.cfg, 'enable_notification_sync', False):
+            return
+        now_ts = time.time()
+        interval = max(300, int(getattr(self.cfg, 'notification_sync_interval_seconds', 600) or 600))
+        if (now_ts - self._last_notification_sync_at) < interval:
+            return
+        self._last_notification_sync_at = now_ts
+        try:
+            from .notifications import NotificationSyncService
+            # 直接复用 NotificationSyncService.fetch_once 的逻辑，但不启动独立 Task
+            if not hasattr(self, '_notification_sync_service'):
+                from .notifications import NotificationSyncService as _NSS
+                self._notification_sync_service = _NSS(
+                    cfg=self.cfg,
+                    db=self.db,
+                    client_provider=lambda: self.client,
+                )
+                if self._notification_sync_callback:
+                    self._notification_sync_service.set_callback(self._notification_sync_callback)
+            new_items = await self._notification_sync_service.fetch_once()
+            if new_items:
+                logger.info(f'[vrc_friend_radar] 通知同步：本轮新增 {len(new_items)} 条站内通知')
+        except Exception as exc:
+            logger.warning(f'[vrc_friend_radar] 通知同步失败（不影响主循环）: {exc}')
 
     def clear_persisted_session(self) -> None:
         self.session_store.clear()
@@ -680,6 +716,11 @@ class MonitorService:
                                 logger.info('[vrc_friend_radar] 疑似认证失效后自动恢复成功，将在下一轮继续监控')
                         else:
                             logger.error(f"[vrc_friend_radar] 轮询检测失败: {exc}", exc_info=True)
+
+            # ---- 统一调度：通知同步（在主循环内串行，不再独立 Task） ----
+            if self.client.is_logged_in():
+                await self._try_periodic_notification_sync()
+
             if self._loop_tick_callback:
                 try:
                     await self._loop_tick_callback(datetime.now())

@@ -27,7 +27,6 @@ from PIL import Image as PILImage, ImageDraw, ImageFilter, ImageFont
 from .core.config import PluginConfig
 from .core.db import RadarDB
 from .core.monitor import MonitorService
-from .core.notifications import NotificationSyncService
 from .core.repository import SearchRepository, SettingsRepository
 from .core.search_state import SearchSession
 from .core.bilibili_parser import BilibiliParser, BilibiliParseError
@@ -89,12 +88,7 @@ class VRCFriendRadarPlugin(Star):
         self.monitor.set_event_callback(self._handle_monitor_events)
         self.monitor.set_loop_tick_callback(self._handle_loop_tick)
         self.monitor.set_notice_callback(self._handle_monitor_notice)
-        self.notification_sync = NotificationSyncService(
-            cfg=self.cfg,
-            db=self.db,
-            client_provider=lambda: self.monitor.client,
-        )
-        self.notification_sync.set_callback(self._handle_new_vrc_notifications)
+        self.monitor.set_notification_sync_callback(self._handle_new_vrc_notifications)
         self._search_sessions: dict[str, SearchSession] = {}
         self._daily_task_last_sent_date: dict[str, str] = {"daily_report": ""}
         self._translation_lock_map: dict[str, asyncio.Lock] = {}
@@ -1236,7 +1230,6 @@ class VRCFriendRadarPlugin(Star):
         merged_notify_groups, merged_watch_friends = self._reconcile_dynamic_lists_on_startup()
         self._daily_task_last_sent_date["daily_report"] = self.settings_repo.get_daily_report_last_sent_date()
         asyncio.create_task(self.monitor.start())
-        asyncio.create_task(self.notification_sync.start())
         self._register_llm_tools()
         logger.info(
             "[vrc_friend_radar] 插件后台初始化开始，已同步列表: notify_groups=%s, watch_friends=%s",
@@ -1246,10 +1239,6 @@ class VRCFriendRadarPlugin(Star):
 
     async def terminate(self):
         await self.monitor.stop()
-        try:
-            await self.notification_sync.stop()
-        except Exception as exc:
-            logger.warning(f"[vrc_friend_radar] 停止通知同步服务失败: {exc}")
         self._search_sessions.clear()
         self._translation_lock_map.clear()
         logger.info("[vrc_friend_radar] 插件已停止")
@@ -3073,7 +3062,10 @@ class VRCFriendRadarPlugin(Star):
     async def notification_center(self, event: AiocqhttpMessageEvent):
         # 先触发一次同步（不阻塞过久）
         try:
-            await asyncio.wait_for(self.notification_sync.fetch_once(), timeout=8)
+            if hasattr(self.monitor, '_notification_sync_service'):
+                await asyncio.wait_for(self.monitor._notification_sync_service.fetch_once(), timeout=8)
+            else:
+                await asyncio.wait_for(self.monitor._try_periodic_notification_sync(), timeout=8)
         except asyncio.TimeoutError:
             logger.warning("[vrc_friend_radar] 站内通知同步超时，使用本地缓存继续响应。")
         except Exception as exc:
